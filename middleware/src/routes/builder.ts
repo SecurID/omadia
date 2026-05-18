@@ -28,6 +28,10 @@ import {
   type BuilderChatDeps,
 } from './builderChat.js';
 import {
+  registerBuilderAuditRoute,
+  type BuilderAuditDeps,
+} from './builderAudit.js';
+import {
   registerBuilderEditRoutes,
   type BuilderEditDeps,
 } from './builderEdit.js';
@@ -71,6 +75,9 @@ export interface BuilderRouterDeps {
    *  /drafts/:id/{spec,slot,model} endpoints stay absent. Wired by
    *  `index.ts` alongside the chat surface. */
   editing?: BuilderEditDeps;
+  /** Audit-log GET surface (issue #56). When omitted, the
+   *  GET /drafts/:id/audit endpoint stays absent. */
+  audit?: BuilderAuditDeps;
   /** SSE event-bus stream (B.5-4). When omitted, the
    *  GET /drafts/:id/events endpoint stays absent. Wired by `index.ts`
    *  alongside the chat + edit surfaces — a single SpecEventBus instance
@@ -441,6 +448,11 @@ export function createBuilderRouter(deps: BuilderRouterDeps): Router {
   // ── Builder inline-edit routes (B.4-4) ─────────────────────────────────
   if (deps.editing) {
     registerBuilderEditRoutes(router, deps.editing);
+  }
+
+  // ── Builder audit-log GET (issue #56) ──────────────────────────────────
+  if (deps.audit) {
+    registerBuilderAuditRoute(router, deps.audit);
   }
 
   // ── Builder SSE event stream (B.5-4) ──────────────────────────────────

@@ -1,11 +1,31 @@
 import { describe, it, beforeEach, afterEach } from 'node:test';
 import { strict as assert } from 'node:assert';
 
+import type { AuditLogger } from '../../../src/plugins/builder/audit.js';
 import { setQualityConfigTool } from '../../../src/plugins/builder/tools/setQualityConfig.js';
 import {
   createBuilderToolHarness,
   type BuilderToolHarness,
 } from '../fixtures/builderToolHarness.js';
+
+interface AuditCall {
+  draftId: string;
+  userEmail: string;
+  action: string;
+  details: Record<string, unknown>;
+}
+
+function createAuditSpy(): { logger: AuditLogger; calls: AuditCall[] } {
+  const calls: AuditCall[] = [];
+  return {
+    calls,
+    logger: {
+      async log(draftId, userEmail, action, details) {
+        calls.push({ draftId, userEmail, action, details: { ...(details ?? {}) } });
+      },
+    },
+  };
+}
 
 /**
  * `set_quality_config` Builder-Tool tests.
@@ -140,5 +160,36 @@ describe('setQualityConfigTool', () => {
     assert.equal(result.ok, true);
     if (!result.ok) return;
     assert.equal(result.warnings, undefined);
+  });
+
+  it('issue #56 — calls audit.log with QUALITY_UPDATED action on success', async () => {
+    const spy = createAuditSpy();
+    const ctx = { ...harness.context(), audit: spy.logger };
+    await setQualityConfigTool.run(
+      {
+        sycophancy: 'medium',
+        boundaries: { presets: ['no-pii'], custom: ['no PII'] },
+      },
+      ctx,
+    );
+    assert.equal(spy.calls.length, 1);
+    const call = spy.calls[0]!;
+    assert.equal(call.action, 'quality_updated');
+    assert.equal(call.draftId, harness.draftId);
+    assert.equal(call.userEmail, harness.userEmail);
+    assert.equal(call.details.sycophancy, 'medium');
+    assert.deepEqual(call.details.presets, ['no-pii']);
+    assert.equal(call.details.customCount, 1);
+  });
+
+  it('issue #56 — audit details carry warnings when unknown preset IDs are submitted', async () => {
+    const spy = createAuditSpy();
+    const ctx = { ...harness.context(), audit: spy.logger };
+    await setQualityConfigTool.run(
+      { boundaries: { presets: ['bogus'], custom: [] } },
+      ctx,
+    );
+    assert.equal(spy.calls.length, 1);
+    assert.deepEqual(spy.calls[0]!.details.warnings, ['unknown preset: bogus']);
   });
 });
