@@ -1,5 +1,6 @@
 import { z } from 'zod';
 
+import { BuilderAuditAction } from '../auditActions.js';
 import type { AgentSpecSkeleton } from '../types.js';
 import {
   IllegalSpecState,
@@ -126,6 +127,13 @@ export const setPersonaConfigTool: BuilderTool<Input, Result> = {
       cause: 'agent',
     });
     ctx.rebuildScheduler.schedule(ctx.userEmail, ctx.draftId);
+
+    // Issue #56 — fire-and-forget audit log
+    void ctx.audit.log(ctx.draftId, ctx.userEmail, BuilderAuditAction.PERSONA_UPDATED, {
+      template: sanitized.template ?? null,
+      axes: Object.keys(sanitized.axes ?? {}),
+      hasCustomNotes: typeof sanitized.custom_notes === 'string' && sanitized.custom_notes.length > 0,
+    });
 
     return {
       ok: true,

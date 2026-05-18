@@ -1,6 +1,7 @@
 import { z } from 'zod';
 
 import { safeParseAgentSpec } from '../agentSpec.js';
+import { BuilderAuditAction } from '../auditActions.js';
 import {
   checkSpecDelta,
   formatViolations as formatContentGuardViolations,
@@ -133,6 +134,11 @@ export const patchSpecTool: BuilderTool<Input, Result> = {
       cause: 'agent',
     });
     ctx.rebuildScheduler.schedule(ctx.userEmail, ctx.draftId);
+
+    // Issue #56 — fire-and-forget audit log
+    void ctx.audit.log(ctx.draftId, ctx.userEmail, BuilderAuditAction.SPEC_PATCHED, {
+      ops: patches.map((p) => ({ op: p.op, path: p.path })),
+    });
 
     return { ok: true, applied: [...patches] };
   },

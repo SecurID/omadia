@@ -1,6 +1,7 @@
 import { z } from 'zod';
 
 import { SycophancyLevelSpecSchema } from '../agentSpec.js';
+import { BuilderAuditAction } from '../auditActions.js';
 import { getBoundaryPreset } from '../boundaryPresets.js';
 import type { AgentSpecSkeleton } from '../types.js';
 import {
@@ -114,6 +115,14 @@ export const setQualityConfigTool: BuilderTool<Input, Result> = {
       unknownPresets.length > 0
         ? unknownPresets.map((id) => `unknown preset: ${id}`)
         : undefined;
+
+    // Issue #56 — fire-and-forget audit log
+    void ctx.audit.log(ctx.draftId, ctx.userEmail, BuilderAuditAction.QUALITY_UPDATED, {
+      sycophancy: input.sycophancy ?? null,
+      presets: input.boundaries?.presets ?? [],
+      customCount: input.boundaries?.custom?.length ?? 0,
+      ...(warnings ? { warnings } : {}),
+    });
 
     const result: OkResult = {
       ok: true,
