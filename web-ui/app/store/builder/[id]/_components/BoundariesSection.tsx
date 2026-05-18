@@ -183,7 +183,7 @@ export function BoundariesSection({
           className="rounded bg-[color:var(--accent)] px-3 py-1 text-sm font-medium text-white disabled:opacity-50"
           data-testid="boundaries-save"
         >
-          {pending ? 'Speichern…' : 'Speichern'}
+          {pending ? 'Boundaries speichern…' : 'Boundaries speichern'}
         </button>
         {savedAt && (
           <span className="text-xs text-[color:var(--fg-muted)]">
