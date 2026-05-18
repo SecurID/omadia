@@ -1950,3 +1950,40 @@ export async function runOperatorPrivacyLiveTest(
     text,
   });
 }
+
+// ── Builder audit log (issue #57) ───────────────────────────────────────────
+
+export interface BuilderAuditEvent {
+  id: number;
+  draftId: string;
+  userEmail: string;
+  action: string;
+  details: Record<string, unknown>;
+  createdAt: number;
+}
+
+export interface BuilderAuditPage {
+  draftId: string;
+  total: number;
+  limit: number;
+  offset: number;
+  events: BuilderAuditEvent[];
+}
+
+/**
+ * Paginated audit-log fetch for a draft. Backed by the `GET /v1/builder/
+ * drafts/:id/audit` route added in #56. Newest-first; default page size
+ * is 30 (server clamps 1..200).
+ */
+export async function listBuilderAudit(
+  draftId: string,
+  opts: { limit?: number; offset?: number } = {},
+): Promise<BuilderAuditPage> {
+  const q = new URLSearchParams();
+  if (typeof opts.limit === 'number') q.set('limit', String(opts.limit));
+  if (typeof opts.offset === 'number') q.set('offset', String(opts.offset));
+  const suffix = q.toString() ? `?${q.toString()}` : '';
+  return getJson<BuilderAuditPage>(
+    `/v1/builder/drafts/${encodeURIComponent(draftId)}/audit${suffix}`,
+  );
+}

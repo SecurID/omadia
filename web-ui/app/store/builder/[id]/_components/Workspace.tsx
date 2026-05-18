@@ -55,6 +55,7 @@ import { SlotEditor } from './SlotEditor';
 import { SpecEditor } from './SpecEditor';
 import { SpecOverview } from './SpecOverview';
 import { UiSurfacesTabPane } from './UiSurfacesTabPane';
+import { AuditTimelinePane } from './AuditTimelinePane';
 import { VersionsTab } from './VersionsTab';
 import { useSpecEvents } from './useSpecEvents';
 
@@ -659,7 +660,15 @@ export function Workspace({ initialDraft }: WorkspaceProps): React.ReactElement 
                 />
               </div>
             )}
-            {tab === 'versions' && <VersionsTab draftId={draft.id} />}
+            {tab === 'versions' && (
+              <>
+                <VersionsTab draftId={draft.id} />
+                {/* Issue #57 — audit timeline as a sidebar inside the
+                 *  Versions tab. Operators see snapshots above and the
+                 *  audit trail below. */}
+                <AuditTimelinePane draftId={draft.id} />
+              </>
+            )}
           </>
         );
         const previewPaneBody = (
