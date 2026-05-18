@@ -897,40 +897,82 @@ export async function patchBuilderSpec(
 }
 
 /**
- * Phase 3 / OB-67 — set the per-profile persona block on a draft. Thin
- * ergonomic wrapper over `patchBuilderSpec` so the Browser-View slider
- * pillar can call a single, structurally-shaped function instead of
- * hand-crafting JSON-Patch ops in every onChange handler. Replaces any
- * existing `spec.persona` block in full; pass `{}` to clear.
+ * Phase 3 / OB-67 — set the per-profile persona block on a draft.
+ *
+ * Issue #53 follow-up — calls the dedicated `PATCH /drafts/:id/persona`
+ * route which routes through `setPersonaConfigTool` server-side. That
+ * gives us tool-side validation, `SpecEventBus.cause='agent'`, and a
+ * `builder_audit` row — parity with BuilderAgent-initiated edits.
+ *
+ * Replaces any existing `spec.persona` block in full; pass `{}` to clear.
  */
 export async function setPersonaConfig(
   draftId: string,
   config: PersonaConfig,
 ): Promise<DraftEnvelope> {
-  return patchBuilderSpec(draftId, [
-    { op: 'add', path: '/persona', value: config },
-  ]);
+  const forwarded = await forwardCookieHeader();
+  const res = await fetch(
+    botApi(`/v1/builder/drafts/${encodeURIComponent(draftId)}/persona`),
+    {
+      method: 'PATCH',
+      headers: {
+        accept: 'application/json',
+        'content-type': 'application/json',
+        ...forwarded,
+      },
+      body: JSON.stringify(config),
+      credentials: 'include',
+      cache: 'no-store',
+    },
+  );
+  const text = await res.text();
+  if (!res.ok) {
+    throw new ApiError(
+      res.status,
+      `PATCH builder/drafts/${draftId}/persona failed: ${res.status}`,
+      text,
+    );
+  }
+  return JSON.parse(text) as DraftEnvelope;
 }
 
 /**
  * Issue #54 — set the per-profile quality block (sycophancy level +
- * boundary presets + custom lines) on a draft. Thin wrapper over
- * `patchBuilderSpec`, mirroring the `setPersonaConfig` ergonomics.
+ * boundary presets + custom lines) on a draft.
  *
- * Unknown boundary preset IDs are not validated server-side here — the
- * UI uses `findUnknownBoundaryPresets` (`boundaryPresets.ts`) against
- * the local registry to surface the same warning before save. A future
- * issue may add a dedicated `PATCH /drafts/:id/quality` route that
- * round-trips the tool result (with warnings) instead of writing via
- * the JSON-Patch surface.
+ * Issue #54 follow-up — calls the dedicated `PATCH /drafts/:id/quality`
+ * route which routes through `setQualityConfigTool` server-side. The
+ * tool's `warnings` for unknown preset IDs are surfaced as an optional
+ * sibling field on the response.
  */
 export async function setQualityConfig(
   draftId: string,
   config: import('./builderTypes').QualityConfig,
-): Promise<DraftEnvelope> {
-  return patchBuilderSpec(draftId, [
-    { op: 'add', path: '/quality', value: config },
-  ]);
+): Promise<DraftEnvelope & { warnings?: string[] }> {
+  const forwarded = await forwardCookieHeader();
+  const res = await fetch(
+    botApi(`/v1/builder/drafts/${encodeURIComponent(draftId)}/quality`),
+    {
+      method: 'PATCH',
+      headers: {
+        accept: 'application/json',
+        'content-type': 'application/json',
+        ...forwarded,
+      },
+      body: JSON.stringify(config),
+      credentials: 'include',
+      cache: 'no-store',
+    },
+  );
+  const text = await res.text();
+  if (!res.ok) {
+    throw new ApiError(
+      res.status,
+      `PATCH builder/drafts/${draftId}/quality failed: ${res.status}`,
+      text,
+    );
+  }
+  return JSON.parse(text) as DraftEnvelope & { warnings?: string[] };
 }
 
 /**
