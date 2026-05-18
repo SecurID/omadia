@@ -913,6 +913,27 @@ export async function setPersonaConfig(
 }
 
 /**
+ * Issue #54 — set the per-profile quality block (sycophancy level +
+ * boundary presets + custom lines) on a draft. Thin wrapper over
+ * `patchBuilderSpec`, mirroring the `setPersonaConfig` ergonomics.
+ *
+ * Unknown boundary preset IDs are not validated server-side here — the
+ * UI uses `findUnknownBoundaryPresets` (`boundaryPresets.ts`) against
+ * the local registry to surface the same warning before save. A future
+ * issue may add a dedicated `PATCH /drafts/:id/quality` route that
+ * round-trips the tool result (with warnings) instead of writing via
+ * the JSON-Patch surface.
+ */
+export async function setQualityConfig(
+  draftId: string,
+  config: import('./builderTypes').QualityConfig,
+): Promise<DraftEnvelope> {
+  return patchBuilderSpec(draftId, [
+    { op: 'add', path: '/quality', value: config },
+  ]);
+}
+
+/**
  * B.11-9: Server-side render of manifest.yaml as it would appear in
  * the next codegen run. Cheap (no zip, no fs writes).
  */

@@ -26,6 +26,7 @@ import type { JobScheduler } from './jobScheduler.js';
 import type { PluginCatalog, PluginCatalogEntry } from './manifestLoader.js';
 import { composePersonaSection } from './personaCompose.js';
 import type { PersonaModelFamily } from './personaDelta.js';
+import { compileBoundariesSection } from './builder/boundaryPresets.js';
 import { compileSycophancyGuard } from './sycophancyGuard.js';
 import { topoSortByDependsOn } from './topoSort.js';
 import type { UploadedPackageStore } from './uploadedPackageStore.js';
@@ -562,11 +563,13 @@ async function loadSystemPrompt(
   // simply get no persona injection. Read failures are swallowed so a
   // mis-packaged plugin doesn't take down activation.
   const personaSection = await composePersonaFromAgentMd(packageRoot, modelId);
+  const boundariesSection = await composeBoundariesFromAgentMd(packageRoot);
   const sycophancySection = await composeSycophancyFromAgentMd(packageRoot);
 
   const header = buildHeader(entry);
   const parts: string[] = [header];
   if (personaSection.length > 0) parts.push(personaSection);
+  if (boundariesSection.length > 0) parts.push(boundariesSection);
   if (sycophancySection.length > 0) parts.push(sycophancySection);
   if (skillParts.length > 0) parts.push(skillParts.join('\n\n---\n\n'));
   return parts.join('\n\n---\n\n');
@@ -597,6 +600,45 @@ export async function composeSycophancyFromAgentMd(packageRoot: string): Promise
     const parsed = parseAgentMd(content);
     const level = parsed.frontmatter?.quality?.sycophancy;
     return compileSycophancyGuard(level);
+  }
+  return '';
+}
+
+/**
+ * Issue #54 — read the plugin's AGENT.md (if present), parse the
+ * frontmatter, and compile the boundaries section (preset prompts +
+ * custom `You must NOT: …` lines). Returns `''` when:
+ *   - no AGENT.md or agent.md file at the package root
+ *   - file read fails
+ *   - frontmatter is missing / malformed
+ *   - `quality.boundaries` is absent or both `presets` and `custom` are empty
+ *
+ * Sits between persona (tone) and sycophancy (style) — boundaries are
+ * hard limits, sycophancy is stylistic. Final compose order:
+ * `[header, persona, boundaries, sycophancy, skill]`.
+ *
+ * Unknown preset IDs (legacy persisted values, or future kemia presets
+ * not yet ported) are silently skipped at runtime — the `setQualityConfig`
+ * tool surfaces them as warnings at edit time so the operator can act on
+ * them before they ship.
+ */
+export async function composeBoundariesFromAgentMd(packageRoot: string): Promise<string> {
+  for (const candidate of ['AGENT.md', 'agent.md']) {
+    const p = path.join(packageRoot, candidate);
+    let content: string;
+    try {
+      content = await fs.readFile(p, 'utf-8');
+    } catch {
+      continue;
+    }
+    const parsed = parseAgentMd(content);
+    const boundaries = parsed.frontmatter?.quality?.boundaries;
+    if (!boundaries) return '';
+    const { text } = compileBoundariesSection(
+      boundaries.presets ?? [],
+      boundaries.custom ?? [],
+    );
+    return text;
   }
   return '';
 }

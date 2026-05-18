@@ -19,6 +19,7 @@ import {
   type PersonaAxisKey,
   type PersonaConfig,
 } from '../../../../_lib/personaTypes';
+import { BoundariesSection } from './BoundariesSection';
 import { ConflictBanner } from './ConflictBanner';
 import { DimensionSlider } from './DimensionSlider';
 import { PersonaRadar, personaAxisToSliderTestId } from './PersonaRadar';
@@ -325,6 +326,16 @@ export function PersonaPillar({
           {(persona.custom_notes ?? '').length} / {PERSONA_CUSTOM_NOTES_MAX_LENGTH}
         </p>
       </div>
+
+      {/* Issue #54 — boundary preset library + custom-line textarea. The
+       *  section persists `spec.quality` independently of the persona
+       *  Speichern button below; mounting here keeps the configuration
+       *  surface alongside other persona / quality tuning controls. */}
+      <BoundariesSection
+        draftId={draftId}
+        initialQuality={quality}
+        disabled={disabled}
+      />
 
       {/* Action row */}
       <div className="flex items-center justify-between gap-3 border-t border-[color:var(--divider)] pt-3">

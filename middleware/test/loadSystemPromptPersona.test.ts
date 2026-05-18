@@ -5,6 +5,7 @@ import path from 'node:path';
 import { afterEach, beforeEach, describe, it } from 'node:test';
 
 import {
+  composeBoundariesFromAgentMd,
   composePersonaFromAgentMd,
   composeSycophancyFromAgentMd,
   inferFamilyFromModel,
@@ -254,5 +255,112 @@ quality:
     );
     const out = await composeSycophancyFromAgentMd(pkgRoot);
     assert.match(out, /^## Accuracy Guidelines\n/);
+  });
+});
+
+describe('composeBoundariesFromAgentMd (issue #54)', () => {
+  let pkgRoot: string;
+
+  beforeEach(async () => {
+    pkgRoot = await fs.mkdtemp(path.join(os.tmpdir(), 'boundaries-rt-'));
+  });
+
+  afterEach(async () => {
+    await fs.rm(pkgRoot, { recursive: true, force: true });
+  });
+
+  it("returns '' when AGENT.md is missing (legacy plugin)", async () => {
+    assert.equal(await composeBoundariesFromAgentMd(pkgRoot), '');
+  });
+
+  it("returns '' when AGENT.md has no quality.boundaries block", async () => {
+    await fs.writeFile(
+      path.join(pkgRoot, 'AGENT.md'),
+      `---
+identity:
+  id: foo
+---
+
+# Body
+`,
+    );
+    assert.equal(await composeBoundariesFromAgentMd(pkgRoot), '');
+  });
+
+  it("returns '' when quality.boundaries has both presets and custom empty", async () => {
+    await fs.writeFile(
+      path.join(pkgRoot, 'AGENT.md'),
+      `---
+quality:
+  boundaries:
+    presets: []
+    custom: []
+---
+
+# Body
+`,
+    );
+    assert.equal(await composeBoundariesFromAgentMd(pkgRoot), '');
+  });
+
+  it('compiles the boundaries section from preset IDs', async () => {
+    await fs.writeFile(
+      path.join(pkgRoot, 'AGENT.md'),
+      `---
+quality:
+  boundaries:
+    presets:
+      - no-pii
+      - no-medical-data
+    custom: []
+---
+
+# Body
+`,
+    );
+    const out = await composeBoundariesFromAgentMd(pkgRoot);
+    assert.match(out, /^## Boundaries\n/);
+    assert.match(out, /personally identifiable information/);
+    assert.match(out, /medical diagnoses/);
+  });
+
+  it('includes custom "You must NOT:" lines after preset prompts', async () => {
+    await fs.writeFile(
+      path.join(pkgRoot, 'AGENT.md'),
+      `---
+quality:
+  boundaries:
+    presets:
+      - no-pii
+    custom:
+      - reveal staff names
+---
+
+# Body
+`,
+    );
+    const out = await composeBoundariesFromAgentMd(pkgRoot);
+    assert.match(out, /personally identifiable information/);
+    assert.match(out, /You must NOT: reveal staff names/);
+  });
+
+  it('silently skips unknown preset IDs at runtime (warnings are edit-time only)', async () => {
+    await fs.writeFile(
+      path.join(pkgRoot, 'AGENT.md'),
+      `---
+quality:
+  boundaries:
+    presets:
+      - no-pii
+      - does-not-exist
+    custom: []
+---
+
+# Body
+`,
+    );
+    const out = await composeBoundariesFromAgentMd(pkgRoot);
+    assert.match(out, /personally identifiable information/);
+    assert.equal(out.includes('does-not-exist'), false);
   });
 });
