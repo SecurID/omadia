@@ -54,6 +54,27 @@ export interface TokenizeMap {
    *  `typeHint` only steers the initial mint and is ignored on
    *  subsequent lookups. */
   tokenFor(value: string, typeHint?: string): string;
+  /**
+   * Privacy-Shield v3 (stable-id tokenization, slice 1.5) — mint a
+   * token keyed by a STABLE ENTITY IDENTITY rather than by the string
+   * value.
+   *
+   * The dedup key is `(displayType, stableId)`. Two consequences:
+   *
+   *   - The same entity (same `stableId`) yields the same token across
+   *     every row / call within the turn, even if the tool reports the
+   *     value slightly differently ("Marvin Vomberg" vs "M. Vomberg").
+   *   - Two DIFFERENT entities that happen to share a value — homonyms
+   *     like two employees both named "Thomas Müller" — get DISTINCT
+   *     tokens, so a ranking table never silently merges their rows.
+   *
+   * The token number is still a map-local counter (collision-free with
+   * `tokenFor`), not the id itself — the id stays off the wire. The
+   * value is registered in the reverse map so `resolve()` works, and
+   * in the value-keyed map (first-writer-wins for a homonym) so
+   * `hasOriginalValue()` stays correct for the Output Validator.
+   */
+  tokenForStableId(value: string, typeHint: string, stableId: string): string;
   /** Look up the original value behind a token. `undefined` for unknown
    *  tokens so the caller can decide what to do (Output Validator
    *  flags hallucinated tokens, restoreTokens leaves them in place). */
@@ -155,16 +176,48 @@ class InMemoryTokenizeMap implements TokenizeMap {
    *  but `«EMAIL_1»` starts independently — readability over global
    *  ordering. */
   private readonly counters = new Map<string, number>();
+  /** Slice 1.5 — `(displayType, stableId)` composite key to token.
+   *  Separate from `forward` (value-keyed) so two homonyms with the
+   *  same value but different ids still get distinct tokens. */
+  private readonly stableForward = new Map<string, string>();
+
+  /** Mint the next `«TYPE_N»` token for `type` and register the reverse
+   *  binding. Shared by `tokenFor` and `tokenForStableId` so both draw
+   *  from the same per-type counter — no token-number collisions. */
+  private mint(type: string, value: string): string {
+    const next = (this.counters.get(type) ?? 0) + 1;
+    this.counters.set(type, next);
+    const token = `«${type}_${String(next)}»`;
+    this.reverse.set(token, value);
+    return token;
+  }
 
   tokenFor(value: string, typeHint?: string): string {
     const existing = this.forward.get(value);
     if (existing !== undefined) return existing;
     const type = displayTypeFor(typeHint);
-    const next = (this.counters.get(type) ?? 0) + 1;
-    this.counters.set(type, next);
-    const token = `«${type}_${String(next)}»`;
+    const token = this.mint(type, value);
     this.forward.set(value, token);
-    this.reverse.set(token, value);
+    return token;
+  }
+
+  tokenForStableId(value: string, typeHint: string, stableId: string): string {
+    const type = displayTypeFor(typeHint);
+    // Composite key joined by a colon. `displayTypeFor` guarantees
+    // `type` is `[A-Z0-9_]+`, so it can never contain the colon — the
+    // first colon always delimits type from stableId and the
+    // `(type, stableId)` pair stays collision-free for any stableId.
+    const stableKey = type.concat(':', stableId);
+    const existing = this.stableForward.get(stableKey);
+    if (existing !== undefined) return existing;
+    const token = this.mint(type, value);
+    this.stableForward.set(stableKey, token);
+    // Register the value-keyed binding too (first-writer-wins for a
+    // homonym) so `hasOriginalValue` stays correct for the Output
+    // Validator and a later NER hit on the same string reuses the token.
+    if (!this.forward.has(value)) {
+      this.forward.set(value, token);
+    }
     return token;
   }
 
@@ -180,6 +233,7 @@ class InMemoryTokenizeMap implements TokenizeMap {
     this.forward.clear();
     this.reverse.clear();
     this.counters.clear();
+    this.stableForward.clear();
   }
 
   get size(): number {
