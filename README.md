@@ -135,15 +135,6 @@ the differentiating logic, and verifying with the smoke runner before install.
 > it the middleware refuses to start (this is intentional; the dev fallback
 > writes the master key into the data volume, which is not safe at rest).
 > Generate one with `openssl rand -base64 32` and wire it as a platform
-> secret (Fly: `fly secrets set VAULT_KEY=…`) before the first deploy. The
-> local Compose stack pins `NODE_ENV=development` so the dev fallback stays
-> available for `docker compose up` without configuration.
-
-> **Required production secret.** The shipped image runs with
-> `NODE_ENV=production`, which makes `VAULT_KEY` mandatory at boot — without
-> it the middleware refuses to start (this is intentional; the dev fallback
-> writes the master key into the data volume, which is not safe at rest).
-> Generate one with `openssl rand -base64 32` and wire it as a platform
 > secret before the first deploy. The bundled `docker-compose.yaml` pins
 > `NODE_ENV=development` so the dev fallback stays available for local
 > `docker compose up` without configuration; drop that override (and set
