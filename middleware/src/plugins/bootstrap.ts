@@ -264,8 +264,11 @@ async function migrateAnthropicKeyToVault(
  * plugin lands with the proper config instead of the empty auto-install
  * default that would miss the env-provided paths.
  *
- * Idempotent: once the registry entry exists we never overwrite the
- * operator's settings.
+ * Idempotent: once the registry entry exists, operator-owned settings
+ * (memory_dir, seed_dir, seed_mode) are never overwritten. The single
+ * exception is `dev_memory_endpoints_enabled`, which is reconciled from
+ * `DEV_ENDPOINTS_ENABLED` on every boot so a container-env flip takes
+ * effect on restart (see the reconcile path below).
  */
 export async function bootstrapMemoryFromEnv(deps: BootstrapDeps): Promise<void> {
   const log = deps.log ?? ((m) => console.log(m));
