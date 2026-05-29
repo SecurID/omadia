@@ -1,5 +1,6 @@
 import type { Metadata } from 'next';
 import Link from 'next/link';
+import { HardDrive, PackageCheck, Store } from 'lucide-react';
 
 import { listProfiles, listStorePlugins } from '../_lib/api';
 import { redirectIfUnauthorized } from '../_lib/authRedirect';
@@ -18,6 +19,11 @@ export const dynamic = 'force-dynamic';
 
 type CategoryFilter = 'all' | PluginKind;
 
+/** Top-level view switch by plugin origin: `hub` = advertised by a remote
+ *  registry, `local` = local catalog package (not installed), `installed` =
+ *  already in the runtime registry. */
+type SourceFilter = 'hub' | 'local' | 'installed';
+
 const FILTER_LABEL: Record<CategoryFilter, string> = {
   all: 'Alle',
   integration: 'Integrations',
@@ -30,9 +36,10 @@ const FILTER_LABEL: Record<CategoryFilter, string> = {
 export default async function StorePage({
   searchParams,
 }: {
-  searchParams: Promise<{ kind?: string }>;
+  searchParams: Promise<{ kind?: string; source?: string }>;
 }): Promise<React.ReactElement> {
   const params = await searchParams;
+  const source = parseSource(params.source);
   const filter = parseFilter(params.kind);
 
   let plugins: Plugin[] = [];
@@ -60,13 +67,34 @@ export default async function StorePage({
     profiles = [];
   }
 
-  const installedCount = plugins.filter(
+  // Three origins, partitioned so every plugin lands in exactly one bucket:
+  //   • Hub         — advertised by a remote registry (`plugin.source` set),
+  //                   available to fetch + install. An installed hub plugin
+  //                   becomes local and leaves this bucket (the store router's
+  //                   local-wins merge drops the remote entry on id collision).
+  //   • Lokal       — local catalog packages (examples / uploaded ZIPs) that
+  //                   are not yet installed.
+  //   • Installiert — anything already in the runtime registry.
+  const hubPlugins = plugins.filter((p) => p.source != null);
+  const installedPlugins = plugins.filter(
     (p) => p.install_state === 'installed',
-  ).length;
+  );
+  const localPlugins = plugins.filter(
+    (p) => p.source == null && p.install_state !== 'installed',
+  );
+  const hubCount = hubPlugins.length;
+  const localCount = localPlugins.length;
+  const installedCount = installedPlugins.length;
 
-  const countsByKind = countByKind(plugins);
+  const scoped =
+    source === 'installed'
+      ? installedPlugins
+      : source === 'local'
+        ? localPlugins
+        : hubPlugins;
+  const countsByKind = countByKind(scoped);
   const visible =
-    filter === 'all' ? plugins : plugins.filter((p) => p.kind === filter);
+    filter === 'all' ? scoped : scoped.filter((p) => p.kind === filter);
 
   return (
     <main className="mx-auto max-w-[1280px] px-6 py-12 lg:px-10 lg:py-16">
@@ -94,34 +122,45 @@ export default async function StorePage({
           und Abhängigkeiten vor der Installation.
         </p>
 
-        {/* Stats strip — three plugin kinds + total */}
+        {/* Stats strip — installed vs. hub split + total */}
         <dl className="mt-10 grid max-w-2xl grid-cols-4 gap-6 border-t border-[color:var(--divider)] pt-5 text-sm">
           <Stat label="Plugins" value={plugins.length} />
-          <Stat label="Integrations" value={countsByKind.integration} />
-          <Stat label="Agents" value={countsByKind.agent} />
-          <Stat label="Channels" value={countsByKind.channel} />
+          <Stat label="Hub" value={hubCount} accent />
+          <Stat label="Lokal" value={localCount} />
+          <Stat label="Installiert" value={installedCount} />
         </dl>
       </header>
 
-      {/* Upload dropzone — lives above the filter tabs so the "here's how to add one" path is visible before scanning the catalog. */}
-      <div className="mt-8">
-        <UploadDropzone />
-      </div>
+      {/* Source switch — the primary view selector by plugin origin. */}
+      <SourceTabs
+        source={source}
+        hubCount={hubCount}
+        localCount={localCount}
+        installedCount={installedCount}
+      />
 
-      {/* Category filter tabs */}
+      {/* Upload dropzone — only in the Lokal view: an uploaded ZIP becomes a
+          local catalog package, which is exactly what this view lists. */}
+      {source === 'local' ? (
+        <div className="mt-6">
+          <UploadDropzone />
+        </div>
+      ) : null}
+
+      {/* Category filter tabs — scoped to the active source. */}
       <nav
-        className="mt-10 flex flex-wrap items-center gap-2"
+        className="mt-8 flex flex-wrap items-center gap-2"
         aria-label="Kategorie filtern"
       >
         {(['all', 'integration', 'agent', 'channel'] as CategoryFilter[]).map(
           (f) => {
             const count =
-              f === 'all' ? plugins.length : countsByKind[f as PluginKind];
+              f === 'all' ? scoped.length : countsByKind[f as PluginKind];
             const active = f === filter;
             return (
               <Link
                 key={f}
-                href={f === 'all' ? '/store' : `/store?kind=${f}`}
+                href={buildHref(source, f)}
                 className={cn(
                   'inline-flex items-center gap-2 rounded-full px-4 py-1.5',
                   'text-[12px] font-semibold transition-colors duration-[140ms]',
@@ -154,7 +193,7 @@ export default async function StorePage({
         {loadError ? (
           <LoadErrorState message={loadError} />
         ) : visible.length === 0 ? (
-          <EmptyState filter={filter} />
+          <EmptyState source={source} filter={filter} />
         ) : (
           <div className="grid gap-5 md:grid-cols-2 xl:grid-cols-3">
             {visible.map((plugin, idx) => (
@@ -211,30 +250,174 @@ function Stat({
   );
 }
 
+/**
+ * Source switch — segmented control toggling between the installed-runtime
+ * view and the Hub catalog. Server-rendered as two `<Link>`s so the active
+ * view is sharable/bookmarkable via `?source=`.
+ */
+function SourceTabs({
+  source,
+  hubCount,
+  localCount,
+  installedCount,
+}: {
+  source: SourceFilter;
+  hubCount: number;
+  localCount: number;
+  installedCount: number;
+}): React.ReactElement {
+  const tabs: Array<{
+    key: SourceFilter;
+    label: string;
+    count: number;
+    icon: React.ReactNode;
+  }> = [
+    {
+      key: 'hub',
+      label: 'Hub',
+      count: hubCount,
+      icon: <Store className="size-4" aria-hidden />,
+    },
+    {
+      key: 'local',
+      label: 'Lokal',
+      count: localCount,
+      icon: <HardDrive className="size-4" aria-hidden />,
+    },
+    {
+      key: 'installed',
+      label: 'Installiert',
+      count: installedCount,
+      icon: <PackageCheck className="size-4" aria-hidden />,
+    },
+  ];
+
+  return (
+    <nav
+      className="mt-8 inline-flex rounded-full border border-[color:var(--border)] bg-[color:var(--bg-soft)] p-1"
+      aria-label="Quelle wählen"
+    >
+      {tabs.map((tab) => {
+        const active = tab.key === source;
+        return (
+          <Link
+            key={tab.key}
+            href={buildHref(tab.key, 'all')}
+            aria-current={active ? 'page' : undefined}
+            className={cn(
+              'inline-flex items-center gap-2 rounded-full px-5 py-2',
+              'text-[13px] font-semibold transition-colors duration-[140ms]',
+              'ease-[cubic-bezier(0.22,0.61,0.36,1)]',
+              active
+                ? 'bg-[color:var(--accent)] text-white shadow-[var(--shadow-cta)]'
+                : 'text-[color:var(--fg-muted)] hover:text-[color:var(--fg-strong)]',
+            )}
+          >
+            {tab.icon}
+            <span>{tab.label}</span>
+            <span
+              className={cn(
+                'font-mono-num tabular-nums rounded-full px-1.5 text-[10px]',
+                active
+                  ? 'bg-white/25 text-white'
+                  : 'bg-[color:var(--bg)] text-[color:var(--fg-subtle)]',
+              )}
+            >
+              {tab.count}
+            </span>
+          </Link>
+        );
+      })}
+    </nav>
+  );
+}
+
 function EmptyState({
+  source,
   filter,
 }: {
+  source: SourceFilter;
   filter: CategoryFilter;
 }): React.ReactElement {
-  const headline =
-    filter === 'all'
-      ? 'Noch keine Plugins im Katalog.'
-      : `Keine ${FILTER_LABEL[filter]} installiert oder verfügbar.`;
+  // Kind-filtered-into-emptiness inside a non-empty source: keep it short.
+  if (filter !== 'all') {
+    return (
+      <div className="rounded-[14px] border border-dashed border-[color:var(--border-strong)] bg-[color:var(--bg-soft)] p-12 text-center">
+        <p className="font-display text-[22px] text-[color:var(--fg-strong)]">
+          Keine {FILTER_LABEL[filter]} in dieser Ansicht.
+        </p>
+        <p className="mt-3 text-sm leading-relaxed text-[color:var(--fg-muted)]">
+          Wechsle die Kategorie oder die Quelle oben.
+        </p>
+      </div>
+    );
+  }
+
+  if (source === 'installed') {
+    return (
+      <div className="rounded-[14px] border border-dashed border-[color:var(--border-strong)] bg-[color:var(--bg-soft)] p-12 text-center">
+        <p className="font-display text-[22px] text-[color:var(--fg-strong)]">
+          Noch keine Plugins installiert.
+        </p>
+        <p className="mt-3 text-sm leading-relaxed text-[color:var(--fg-muted)]">
+          Wechsle zum{' '}
+          <Link
+            href={buildHref('hub', 'all')}
+            className="font-semibold text-[color:var(--accent)] underline-offset-4 hover:underline"
+          >
+            Hub
+          </Link>{' '}
+          oder{' '}
+          <Link
+            href={buildHref('local', 'all')}
+            className="font-semibold text-[color:var(--accent)] underline-offset-4 hover:underline"
+          >
+            Lokal
+          </Link>
+          , um verfügbare Plugins zu durchsuchen und zu installieren.
+        </p>
+      </div>
+    );
+  }
+
+  if (source === 'local') {
+    return (
+      <div className="rounded-[14px] border border-dashed border-[color:var(--border-strong)] bg-[color:var(--bg-soft)] p-12 text-center">
+        <p className="font-display text-[22px] text-[color:var(--fg-strong)]">
+          Keine lokalen Pakete.
+        </p>
+        <p className="mt-3 text-sm leading-relaxed text-[color:var(--fg-muted)]">
+          Lade ein Plugin-Paket per Drag-&-Drop oben hoch — der Server validiert
+          das Manifest und registriert es im Katalog.
+        </p>
+      </div>
+    );
+  }
+
+  // source === 'hub' and empty — no remote registry advertises an installable
+  // (not-yet-local) plugin. Either no registry is reachable, or every hub
+  // entry is already installed locally (the merge drops those).
   return (
     <div className="rounded-[14px] border border-dashed border-[color:var(--border-strong)] bg-[color:var(--bg-soft)] p-12 text-center">
       <p className="font-display text-[22px] text-[color:var(--fg-strong)]">
-        {headline}
+        Keine Plugins im Hub verfügbar.
       </p>
       <p className="mt-3 text-sm leading-relaxed text-[color:var(--fg-muted)]">
-        Lege ein{' '}
-        <span className="font-mono-num text-[color:var(--fg)]">
-          *.manifest.yaml
-        </span>{' '}
-        unter{' '}
-        <span className="font-mono-num text-[color:var(--fg)]">
-          docs/harness-platform/examples/
-        </span>{' '}
-        ab und starte die Middleware neu.
+        Verbinde eine Registry unter{' '}
+        <Link
+          href="/admin/registries"
+          className="font-semibold text-[color:var(--accent)] underline-offset-4 hover:underline"
+        >
+          Admin · Registries
+        </Link>{' '}
+        — oder lade ein eigenes Paket im{' '}
+        <Link
+          href={buildHref('local', 'all')}
+          className="font-semibold text-[color:var(--accent)] underline-offset-4 hover:underline"
+        >
+          Lokal
+        </Link>
+        -Tab hoch.
       </p>
     </div>
   );
@@ -271,6 +454,22 @@ function LoadErrorState({ message }: { message: string }): React.ReactElement {
 // ---------------------------------------------------------------------------
 // Helpers
 // ---------------------------------------------------------------------------
+
+function parseSource(raw: string | undefined): SourceFilter {
+  if (raw === 'installed') return 'installed';
+  if (raw === 'local') return 'local';
+  return 'hub';
+}
+
+/** Build a `/store` href preserving the source/kind pair. `hub` + `all` are
+ *  the defaults, so they are omitted to keep the canonical URL clean. */
+function buildHref(source: SourceFilter, kind: CategoryFilter): string {
+  const params = new URLSearchParams();
+  if (source !== 'hub') params.set('source', source);
+  if (kind !== 'all') params.set('kind', kind);
+  const qs = params.toString();
+  return qs ? `/store?${qs}` : '/store';
+}
 
 function parseFilter(raw: string | undefined): CategoryFilter {
   if (

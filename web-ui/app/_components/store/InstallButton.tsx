@@ -10,6 +10,7 @@ import {
   createInstallJob,
   deleteUploadedPackage,
   getInstalledPlugin,
+  installFromRegistry,
   uninstallPlugin,
   updateInstalledPluginConfig,
   ApiError,
@@ -29,6 +30,10 @@ interface InstallButtonProps {
   installState: 'available' | 'installed' | 'update-available' | 'incompatible';
   enabled: boolean;
   blockingReasons?: string[];
+  /** When true the plugin lives on a remote registry and is not yet ingested
+   *  locally: install first fetches + ingests the ZIP (POST /install/registry),
+   *  then proceeds with the normal install job. */
+  remote?: boolean;
 }
 
 type Phase =
@@ -46,6 +51,7 @@ export function InstallButton({
   installState,
   enabled,
   blockingReasons,
+  remote = false,
 }: InstallButtonProps): React.ReactElement {
   const router = useRouter();
   const [phase, setPhase] = useState<Phase>({ kind: 'idle' });
@@ -160,6 +166,19 @@ export function InstallButton({
     setPhase({ kind: 'creating' });
     setFieldErrors({});
     try {
+      // Remote plugin: pull + sha256-verify + ingest the ZIP locally first
+      // (C2). The server also resolves + ingests the target's depends_on
+      // parents (C5): when any are missing, it returns a `chain` and we open
+      // the chained wizard (parents → target) instead of installing the
+      // target directly — the install gate is strict on depends_on because the
+      // child inherits the parent's vault credentials.
+      if (remote) {
+        const reg = await installFromRegistry(pluginId);
+        if (reg.chain && reg.chain.available_providers.length > 0) {
+          setPhase({ kind: 'wizard', resolution: reg.chain });
+          return;
+        }
+      }
       const resp = await createInstallJob(pluginId);
       setPhase({ kind: 'form', job: resp.job });
     } catch (err) {
