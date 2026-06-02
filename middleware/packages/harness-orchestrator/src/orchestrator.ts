@@ -18,6 +18,12 @@ import type {
 } from '@omadia/orchestrator-extras';
 import { promoteTurnIfSignificant } from '@omadia/orchestrator-extras';
 import type { AskObserver, DomainTool } from './tools/domainQueryTool.js';
+import type {
+  TurnAnnotation,
+  TurnHookPayload,
+  TurnHookPoint,
+  TurnHookRunner,
+} from './turnHooks.js';
 import {
   KnowledgeGraphTool,
   KNOWLEDGE_GRAPH_TOOL_NAME,
@@ -141,6 +147,12 @@ export interface OrchestratorOptions {
    *  between the orchestrator and the plugin-activation pipeline so plugin-
    *  contributed tools land in the same dispatch map as the kernel's own. */
   nativeToolRegistry: NativeToolRegistry;
+  /**
+   * Optional. #133 (plan-as-data) slice E0 — side-channel turn-hook runner.
+   * When set, the orchestrator fires `onBeforeTurn` / `onAfterToolCall` /
+   * `onAfterTurn` during the turn. Absent → hooks are simply never fired.
+   */
+  turnHookRegistry?: TurnHookRunner;
   sessionLogger?: SessionLogger;
   /** Optional. When set, EntityRefs observed during a turn are attached to the session log. */
   entityRefBus?: EntityRefBus;
@@ -773,6 +785,8 @@ export class Orchestrator {
   private readonly contextRetriever: ContextRetriever | undefined;
   private readonly sessionBriefing: SessionBriefingService | undefined;
   private readonly factExtractor: FactExtractor | undefined;
+  /** #133 E0 — optional side-channel turn-hook runner (see OrchestratorOptions). */
+  private readonly turnHookRegistry: TurnHookRunner | undefined;
   private readonly askUserChoiceTool: AskUserChoiceTool | undefined;
   private readonly suggestFollowUpsTool: SuggestFollowUpsTool | undefined;
   private readonly chatParticipantsTool: ChatParticipantsTool | undefined;
@@ -844,6 +858,7 @@ export class Orchestrator {
     this.entityRefBus = options.entityRefBus;
     this.contextRetriever = options.contextRetriever;
     this.sessionBriefing = options.sessionBriefing;
+    this.turnHookRegistry = options.turnHookRegistry;
 
     this.nativeTools = options.nativeToolRegistry;
     for (const name of KERNEL_NATIVE_TOOL_NAMES) {
@@ -1446,13 +1461,99 @@ export class Orchestrator {
     );
   }
 
+  /**
+   * Fire a turn-hook side-channel (#133 E0). No-op when no runner is
+   * injected. Never throws — the runner swallows hook errors, and we add a
+   * defensive try/catch so a misbehaving runner cannot abort the turn.
+   */
+  private async fireTurnHook(
+    point: TurnHookPoint,
+    turnId: string,
+    input: ChatTurnInput,
+    payload: TurnHookPayload,
+    /**
+     * Optional cap (ms). The post-turn observer hooks (onAfterToolCall /
+     * onAfterTurn) MUST NOT gate the turn: a slow or hung consumer (e.g. a
+     * stalled KG write) would otherwise block the streamed answer forever.
+     * When set, we stop waiting after `timeoutMs` and let the turn proceed;
+     * the hook keeps running detached. `onBeforeTurn` is left UNBOUNDED — its
+     * plan must be materialised before the turn executes.
+     */
+    timeoutMs?: number,
+  ): Promise<TurnAnnotation[]> {
+    const runner = this.turnHookRegistry;
+    if (!runner) return [];
+    const onFail = (err: unknown): TurnAnnotation[] => {
+      console.error(
+        `[orchestrator] turn-hook ${point} runner threw (continuing):`,
+        err instanceof Error ? err.message : err,
+      );
+      return [];
+    };
+    try {
+      // Self-catching so a rejecting hook can never surface as an unhandled
+      // rejection once we stop awaiting it on timeout.
+      const run = Promise.resolve(
+        runner.run(
+          point,
+          {
+            turnId,
+            ...(input.sessionScope ? { sessionScope: input.sessionScope } : {}),
+            ...(input.userId ? { userId: input.userId } : {}),
+          },
+          payload,
+        ),
+      ).catch(onFail);
+      if (timeoutMs && timeoutMs > 0) {
+        // Bounded: a slow observer must not gate the stream. If it times out we
+        // return no annotations (this emit is skipped; a later one catches up).
+        let timer: ReturnType<typeof setTimeout> | undefined;
+        const guard = new Promise<TurnAnnotation[]>((resolve) => {
+          timer = setTimeout(() => resolve([]), timeoutMs);
+        });
+        return await Promise.race([
+          run.finally(() => {
+            if (timer) clearTimeout(timer);
+          }),
+          guard,
+        ]);
+      }
+      return await run;
+    } catch (err) {
+      return onFail(err);
+    }
+  }
+
+  /** #133 (E9) — map turn-hook annotations to `turn_annotation` stream events.
+   *  The orchestrator forwards them opaquely; only the streaming path emits. */
+  private toAnnotationEvents(annotations: TurnAnnotation[]): ChatStreamEvent[] {
+    return annotations.map((a) => ({
+      type: 'turn_annotation' as const,
+      channel: a.channel,
+      payload: a.payload,
+    }));
+  }
+
   private async chatInContext(
     input: ChatTurnInput,
     turnId: string,
   ): Promise<ChatTurnResult> {
     this.applyTurnAuthContext(input);
     try {
-      return await this.chatInContextInner(input, turnId);
+      const result = await this.chatInContextInner(input, turnId);
+      await this.fireTurnHook(
+        'onAfterTurn',
+        turnId,
+        input,
+        {
+          assistantAnswer: result.answer,
+          // #133 (E8) — surface the persisted Turn node id so observers can
+          // link to the graph Turn (plan-runner PLAN_OF). Absent if the log failed.
+          ...(result.turnId ? { turnExternalId: result.turnId } : {}),
+        },
+        2000,
+      );
+      return result;
     } finally {
       this.clearTurnAuthContext();
     }
@@ -1462,6 +1563,9 @@ export class Orchestrator {
     input: ChatTurnInput,
     turnId: string,
   ): Promise<ChatTurnResult> {
+    await this.fireTurnHook('onBeforeTurn', turnId, input, {
+      userMessage: input.userMessage,
+    });
     const priorContext = await this.retrievePriorContext(input);
     const effectiveExtraSystemHint = composeExtraSystemHint(input);
     // Palaia Phase 8 (OB-77) — per-turn nudge counter (shared across all
@@ -1711,6 +1815,24 @@ export class Orchestrator {
             ...(isError ? { is_error: true } : {}),
           };
         });
+        // #133 E0 — fire onAfterToolCall once per top-level tool invocation.
+        for (let i = 0; i < toolUses.length; i++) {
+          const use = toolUses[i]!;
+          const name = (use as { name?: unknown }).name;
+          const resultBlock = toolResults[i] as { content?: unknown };
+          await this.fireTurnHook(
+            'onAfterToolCall',
+            turnId,
+            input,
+            {
+              ...(typeof name === 'string' ? { toolName: name } : {}),
+              ...(typeof resultBlock.content === 'string'
+                ? { toolResult: resultBlock.content }
+                : {}),
+            },
+            2000,
+          );
+        }
         await this.applyNudgePipeline(
           toolUses,
           toolResults,
@@ -1841,8 +1963,37 @@ export class Orchestrator {
     });
 
     this.applyTurnAuthContext(input);
+    // #133 E0 — streaming-path turn hooks. tool_result events carry only the
+    // tool-use id, so track id→name from tool_use events to label
+    // onAfterToolCall.
+    const toolNameById = new Map<string, string>();
+    // #133 (E9) — onBeforeTurn is unbounded, so the plan-runner's plan snapshot
+    // is emitted as the FIRST stream event, before any answer tokens.
+    yield* this.toAnnotationEvents(
+      await this.fireTurnHook('onBeforeTurn', turnId, input, {
+        userMessage: input.userMessage,
+      }),
+    );
     try {
       for await (const event of this.chatStreamInner(input, turnId, observer)) {
+        if (event.type === 'tool_use') {
+          toolNameById.set(event.id, event.name);
+        } else if (event.type === 'tool_result') {
+          const toolName = toolNameById.get(event.id);
+          // Live step updates: emit the refreshed plan snapshot after each tool.
+          yield* this.toAnnotationEvents(
+            await this.fireTurnHook(
+              'onAfterToolCall',
+              turnId,
+              input,
+              {
+                ...(toolName ? { toolName } : {}),
+                toolResult: event.output,
+              },
+              2000,
+            ),
+          );
+        }
         if (event.type === 'done' && privacyHandle) {
           // Privacy-Shield v4 — swap in the server-materialized answer
           // (real values, never round-tripped through the LLM) before the
@@ -1869,8 +2020,35 @@ export class Orchestrator {
               err,
             );
           }
+          yield* this.toAnnotationEvents(
+            await this.fireTurnHook(
+              'onAfterTurn',
+              turnId,
+              input,
+              {
+                assistantAnswer: doneEvent.answer,
+                // #133 (E8) — persisted Turn node id for graph-linking observers.
+                ...(doneEvent.turnId ? { turnExternalId: doneEvent.turnId } : {}),
+              },
+              2000,
+            ),
+          );
           yield doneEvent;
           continue;
+        }
+        if (event.type === 'done') {
+          yield* this.toAnnotationEvents(
+            await this.fireTurnHook(
+              'onAfterTurn',
+              turnId,
+              input,
+              {
+                assistantAnswer: event.answer,
+                ...(event.turnId ? { turnExternalId: event.turnId } : {}),
+              },
+              2000,
+            ),
+          );
         }
         yield event;
       }

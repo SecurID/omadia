@@ -167,6 +167,16 @@ export {
   buildDateHeader,
 } from './turnContext.js';
 export type { TurnContextValue } from './turnContext.js';
+export type {
+  TurnAnnotation,
+  TurnHook,
+  TurnHookContext,
+  TurnHookPayload,
+  TurnHookPoint,
+  TurnHookRegistrar,
+  TurnHookRegistration,
+  TurnHookRunner,
+} from './turnHooks.js';
 
 // Chat-participants contract (Teams roster provider seam)
 export type {

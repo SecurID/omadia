@@ -368,6 +368,14 @@ export interface ChatTurnResult {
    * `'canvas'` capability ignore it. Sidecar — does NOT short-circuit the turn.
    */
   surface?: PendingCanvasSurface;
+  /**
+   * #133 — the persisted Turn node external id (`turn:<scope>:<time>`) for this
+   * turn. Present when a sessionScope was supplied and the session log landed;
+   * absent for scope-less dev calls or a failed log. Lets clients link a turn
+   * to its graph artefacts (e.g. resolving the turn's plan DAG, save-as-memory
+   * provenance) without re-deriving the id.
+   */
+  turnId?: string;
 }
 
 /**
@@ -539,6 +547,9 @@ export type ChatStreamEvent =
       /** Privacy Shield v4 — real values in `answer` the LLM never saw;
        *  clients MAY highlight their occurrences. */
       maskedValues?: readonly string[];
+      /** #133 — persisted Turn node external id (`turn:<scope>:<time>`); see
+       *  ChatTurnResult.turnId. Lets the UI resolve the turn's plan DAG. */
+      turnId?: string;
     }
   /**
    * Emitted after `done` by the verifier wrapper (only when enabled). The
@@ -546,6 +557,15 @@ export type ChatStreamEvent =
    * event. Never emitted by the base orchestrator.
    */
   | { type: 'verifier'; summary: VerifierResultSummary }
+  /**
+   * #133 (E9) — opaque turn annotation a turn-hook emitted, forwarded by the
+   * orchestrator without inspecting it (it stays plan-agnostic). `channel`
+   * routes it client-side (e.g. the plan-runner emits `channel: 'plan'` with a
+   * plan-DAG snapshot at turn start + on every step change, so the UI renders
+   * the live plan from the stream instead of polling). Additive; clients that
+   * don't recognise a channel ignore the event.
+   */
+  | { type: 'turn_annotation'; channel: string; payload: unknown }
   | { type: 'error'; message: string }
   /**
    * Omadia UI canvas surface events (omadia-canvas-protocol/1.0). Additive;

@@ -7,6 +7,7 @@ import type {
   ElementDefinition,
   EventObject,
   LayoutOptions,
+  NodeCollection,
   NodeSingular,
 } from 'cytoscape';
 import fcose from 'cytoscape-fcose';
@@ -18,11 +19,13 @@ import {
   type IssueOverlay,
   type MemoryView,
   type NodeType,
+  type PlanOverlay,
   type RunTraceView,
   type SessionView,
   type TopicOverlay,
   nodeColor,
   nodeLabel,
+  planStepColor,
 } from './graphTypes';
 
 let fcoseRegistered = false;
@@ -59,6 +62,9 @@ interface Props {
    *  CONFLICTS_WITH/DUPLICATE_OF edges). Rendered when
    *  `filter.showIssues=true`. */
   issueOverlay?: IssueOverlay | null;
+  /** #133 — per-turn plan DAG overlay (Plan + PlanStep nodes + STEP_OF /
+   *  DEPENDS_ON edges). Rendered when `filter.showPlans=true`. */
+  planOverlay?: PlanOverlay | null;
   selectedId: string | null;
   filter?: GraphFilter;
   onSelectNode: (node: GraphNode | null) => void;
@@ -87,6 +93,7 @@ function buildElements(
   focusMemories: boolean,
   topicOverlay: TopicOverlay | null,
   issueOverlay: IssueOverlay | null,
+  planOverlay: PlanOverlay | null,
 ): BuiltElements {
   const nodes = new Map<string, GraphNode>();
   const edges = new Map<string, ElementDefinition>();
@@ -342,6 +349,31 @@ function buildElements(
   // MergeCandidate nodes that the operator explicitly opted into via
   // `showTopics` / `showIssues` are kept (they're conceptually a
   // *member* of the memory neighbourhood, not noise).
+  // #133 — Plan overlay. Inject Plan + PlanStep nodes, STEP_OF edges to the
+  // plan, and DEPENDS_ON edges between steps (resolved via raw stepId).
+  if (planOverlay && filter.showPlans) {
+    for (const { plan, steps } of planOverlay.plans) {
+      addNode(plan);
+      const byRawId = new Map<string, string>();
+      for (const s of steps) {
+        const raw = s.props['stepId'];
+        if (typeof raw === 'string') byRawId.set(raw, s.id);
+      }
+      for (const s of steps) {
+        addNode(s);
+        addEdge(s.id, plan.id, 'STEP_OF');
+        const deps = s.props['dependsOn'];
+        if (Array.isArray(deps)) {
+          for (const dep of deps) {
+            const target =
+              typeof dep === 'string' ? byRawId.get(dep) : undefined;
+            if (target) addEdge(s.id, target, 'DEPENDS_ON');
+          }
+        }
+      }
+    }
+  }
+
   if (focusMemories && memoryView) {
     for (const [id, n] of [...nodes]) {
       if (memorySet.has(id)) continue;
@@ -365,7 +397,10 @@ function buildElements(
         id: n.id,
         type: n.type,
         label: nodeLabel(n),
-        color: nodeColor(n.type),
+        color:
+          n.type === 'PlanStep'
+            ? planStepColor(n.props['status'])
+            : nodeColor(n.type),
         mentionCount: mc,
       },
       group: 'nodes',
@@ -407,6 +442,10 @@ function baseSize(type: NodeType): number {
       return 26;
     case 'User':
       return 32;
+    case 'Plan':
+      return 46;
+    case 'PlanStep':
+      return 30;
     default:
       return 28;
   }
@@ -421,10 +460,35 @@ function nodeSize(type: NodeType, mentionCount: number): number {
   return b;
 }
 
-function buildLayout(nodeCount: number, sparse: boolean): LayoutOptions {
+function buildLayout(
+  nodeCount: number,
+  sparse: boolean,
+  planRoots?: NodeCollection,
+): LayoutOptions {
   const tiny = nodeCount < 50;
   const heavy = nodeCount > 200;
   const huge = nodeCount > 600;
+  // #133 — when the canvas is dominated by a plan DAG, lay it out
+  // hierarchically rooted at the Plan node(s) instead of fcose's force cloud:
+  // the Plan sits on top, its PlanSteps fan out below, and DEPENDS_ON
+  // sequencing reads top-down. `breadthfirst` is a cytoscape core layout, so
+  // this needs no extra dependency (important given the standalone-bundle
+  // fragility this stack has). `directed:false` keeps the layering robust to
+  // STEP_OF pointing step→plan (incoming to the root).
+  if (planRoots && planRoots.length > 0) {
+    return {
+      name: 'breadthfirst',
+      directed: false,
+      roots: planRoots,
+      spacingFactor: 1.4,
+      padding: 60,
+      avoidOverlap: true,
+      nodeDimensionsIncludeLabels: true,
+      animate: !heavy,
+      animationDuration: heavy ? 0 : 400,
+      fit: true,
+    } as unknown as LayoutOptions;
+  }
   // Sparse mode (entity-only default) → spread nodes further so cross-refs
   // and producer-anchors stay visually distinct.
   const repulsionBase = huge ? 6000 : tiny ? 24000 : 10000;
@@ -455,6 +519,7 @@ export default function GraphCanvas({
   focusMemories = false,
   topicOverlay = null,
   issueOverlay = null,
+  planOverlay = null,
   selectedId,
   filter = DEFAULT_FILTER,
   onSelectNode,
@@ -477,6 +542,7 @@ export default function GraphCanvas({
         focusMemories,
         topicOverlay,
         issueOverlay,
+        planOverlay,
       ),
     [
       session,
@@ -488,6 +554,7 @@ export default function GraphCanvas({
       focusMemories,
       topicOverlay,
       issueOverlay,
+      planOverlay,
     ],
   );
   // Synced via a post-render effect (never during render) to satisfy the
@@ -497,6 +564,18 @@ export default function GraphCanvas({
     nodesRef.current = nodes;
   });
   const sparse = !filter.showTrace;
+  // #133 — switch to the hierarchical plan-DAG layout only when the canvas is
+  // plan-dominated (overlay on + Plan/PlanStep nodes are at least half of all
+  // nodes). In mixed views (session + entities + a plan) fcose still wins, so
+  // breadthfirst never mangles a graph that isn't mostly a plan.
+  const planFocus = useMemo(() => {
+    if (!filter.showPlans || nodes.size === 0) return false;
+    let planCount = 0;
+    for (const n of nodes.values()) {
+      if (n.type === 'Plan' || n.type === 'PlanStep') planCount += 1;
+    }
+    return planCount > 0 && planCount >= nodes.size * 0.5;
+  }, [filter.showPlans, nodes]);
 
   useEffect(() => {
     ensureFcose();
@@ -672,6 +751,30 @@ export default function GraphCanvas({
             opacity: 0.85,
           },
         },
+        // #133 — Plan DAG edges. STEP_OF is structural membership
+        // (step → plan): faded + dotted so it recedes. DEPENDS_ON is the
+        // step-to-prerequisite sequencing the breadthfirst layout follows:
+        // solid indigo with a prominent arrow so the flow reads as primary.
+        {
+          selector: 'edge[label = "STEP_OF"]',
+          style: {
+            'line-color': '#a78bfa',
+            'target-arrow-color': '#a78bfa',
+            'line-style': 'dotted',
+            width: 1,
+            opacity: 0.45,
+          },
+        },
+        {
+          selector: 'edge[label = "DEPENDS_ON"]',
+          style: {
+            'line-color': '#6366f1',
+            'target-arrow-color': '#6366f1',
+            width: 1.8,
+            'arrow-scale': 1,
+            opacity: 0.9,
+          },
+        },
         {
           selector: 'edge.faded',
           style: { opacity: 0.08 },
@@ -746,7 +849,8 @@ export default function GraphCanvas({
     layoutTimer.current = setTimeout(() => {
       const count = cy.nodes().length;
       if (count === 0) return;
-      const layout = cy.layout(buildLayout(count, sparse));
+      const roots = planFocus ? cy.nodes('[type = "Plan"]') : undefined;
+      const layout = cy.layout(buildLayout(count, sparse, roots));
       layout.run();
       layoutedOnce.current = true;
     }, delay);
@@ -754,7 +858,7 @@ export default function GraphCanvas({
     return () => {
       if (layoutTimer.current) clearTimeout(layoutTimer.current);
     };
-  }, [elements, sparse]);
+  }, [elements, sparse, planFocus]);
 
   useEffect(() => {
     const cy = cyRef.current;
@@ -791,7 +895,8 @@ export default function GraphCanvas({
     if (!cy) return;
     const count = cy.nodes().length;
     if (count === 0) return;
-    cy.layout(buildLayout(count, sparse)).run();
+    const roots = planFocus ? cy.nodes('[type = "Plan"]') : undefined;
+    cy.layout(buildLayout(count, sparse, roots)).run();
   };
 
   return (
@@ -882,6 +987,9 @@ function Legend({
       ['ExcerptMergeCandidate', 'Excerpt-Duplikat'],
     );
   }
+  if (filter.showPlans) {
+    items.push(['Plan', 'Plan'], ['PlanStep', 'Plan-Schritt']);
+  }
   const edgeRows: Array<[string, string]> = [['#10b981', 'PRODUCED']];
   edgeRows.push(['#ec4899', 'TRIGGERED']);
   if (filter.showCrossRefs) edgeRows.push(['#a855f7', 'RELATED']);
@@ -896,6 +1004,10 @@ function Legend({
     edgeRows.push(['#ef4444', 'CONFLICTS_WITH']);
     edgeRows.push(['#f97316', 'DUPLICATE_OF (MK)']);
     edgeRows.push(['#fb923c', 'DUPLICATE_EXCERPT_OF']);
+  }
+  if (filter.showPlans) {
+    edgeRows.push(['#a78bfa', 'STEP_OF']);
+    edgeRows.push(['#6366f1', 'DEPENDS_ON']);
   }
 
   return (

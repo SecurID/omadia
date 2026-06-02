@@ -21,7 +21,12 @@
  * the Orchestrator itself — hooks are side-channel observers, not gatekeepers.
  */
 
-export type TurnHookPoint = 'onBeforeTurn' | 'onAfterToolCall' | 'onAfterTurn';
+export type TurnHookPoint =
+  | 'onBeforeTurn'
+  | 'onAfterToolCall'
+  | 'onAfterTurn'
+  /** #133 (E6) — fired by VerifierService on a `blocked` verdict. */
+  | 'onVerifierBlocked';
 
 /** Opaque turn-context. Shape evolves with the registry's consumers; for v1
  *  we keep it narrow — `turnId` is enough for correlation, everything else
@@ -37,12 +42,21 @@ export interface TurnHookPayload {
   readonly assistantAnswer?: string;
   readonly toolName?: string;
   readonly toolResult?: string;
+  /** #133 (E6) — verifier block reason, set on `onVerifierBlocked`. */
+  readonly blockReason?: string;
+}
+
+/** #133 (E9) — opaque annotation a hook returns for the orchestrator to emit
+ *  into the turn's event stream. Mirrors `@omadia/orchestrator`'s contract. */
+export interface TurnAnnotation {
+  readonly channel: string;
+  readonly payload: unknown;
 }
 
 export type TurnHook = (
   ctx: TurnHookContext,
   payload: TurnHookPayload,
-) => void | Promise<void>;
+) => void | TurnAnnotation[] | Promise<void | TurnAnnotation[]>;
 
 interface HookEntry {
   readonly hook: TurnHook;
@@ -90,16 +104,19 @@ export class TurnHookRegistry {
     point: TurnHookPoint,
     ctx: TurnHookContext,
     payload: TurnHookPayload,
-  ): Promise<void> {
+  ): Promise<TurnAnnotation[]> {
     const list = this.byPoint.get(point);
-    if (!list || list.length === 0) return;
+    if (!list || list.length === 0) return [];
+    const annotations: TurnAnnotation[] = [];
     for (const entry of list) {
       try {
-        await entry.hook(ctx, payload);
+        const result = await entry.hook(ctx, payload);
+        if (Array.isArray(result)) annotations.push(...result);
       } catch (err) {
         this.log(`[turn-hook] ${point}/${entry.label} threw`, err);
       }
     }
+    return annotations;
   }
 
   /** Diagnostic: how many hooks at each point. Used by the introspection route
@@ -109,6 +126,7 @@ export class TurnHookRegistry {
       onBeforeTurn: this.byPoint.get('onBeforeTurn')?.length ?? 0,
       onAfterToolCall: this.byPoint.get('onAfterToolCall')?.length ?? 0,
       onAfterTurn: this.byPoint.get('onAfterTurn')?.length ?? 0,
+      onVerifierBlocked: this.byPoint.get('onVerifierBlocked')?.length ?? 0,
     };
   }
 }

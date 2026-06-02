@@ -33,6 +33,11 @@ import type {
   FactIngestResult,
   FindEntitiesOptions,
   GraphNode,
+  PlanIngest,
+  PlanIngestResult,
+  PlanStepIngest,
+  PlanStepIngestResult,
+  PlanStepStatus,
   GraphStats,
   InconsistencyDetectorService,
   InconsistencyNode,
@@ -156,6 +161,34 @@ export class InconsistencyTriggeringKnowledgeGraph implements KnowledgeGraph {
   }
   ingestRun(trace: RunTrace): Promise<RunIngestResult> {
     return this.inner.ingestRun(trace);
+  }
+
+  ingestPlan(input: PlanIngest): Promise<PlanIngestResult> {
+    return this.inner.ingestPlan(input);
+  }
+
+  upsertPlanStep(input: PlanStepIngest): Promise<PlanStepIngestResult> {
+    return this.inner.upsertPlanStep(input);
+  }
+
+  getPlan(planExternalId: string): Promise<GraphNode | null> {
+    return this.inner.getPlan(planExternalId);
+  }
+
+  getPlanSteps(planExternalId: string): Promise<GraphNode[]> {
+    return this.inner.getPlanSteps(planExternalId);
+  }
+
+  setPlanStepStatus(
+    stepExternalId: string,
+    status: PlanStepStatus,
+    opts?: { resultSummary?: string },
+  ): Promise<void> {
+    return this.inner.setPlanStepStatus(stepExternalId, status, opts);
+  }
+
+  listPlansForScope(scope: string): Promise<GraphNode[]> {
+    return this.inner.listPlansForScope(scope);
   }
   getRunForTurn(turnExternalId: string): Promise<RunTraceView | null> {
     return this.inner.getRunForTurn(turnExternalId);
