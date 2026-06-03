@@ -26,6 +26,15 @@ export type {
   AssembledHitReason,
   AssembledExclusion,
 } from './contextRetriever.js';
+// Cross-session recall payload types are canonically defined in
+// @omadia/plugin-api; re-exported here for back-compat with consumers that
+// import them alongside `AssembledContext` from this package.
+export type {
+  RecalledContext,
+  RecalledPlan,
+  RecalledProcess,
+  RecalledInsight,
+} from '@omadia/plugin-api';
 
 // OB-75 — palaia Phase 6 Session-Continuity (Briefings + Summaries).
 export {

@@ -90,6 +90,20 @@ export interface KnowledgeGraph {
    */
   listPlansForScope(scope: string): Promise<GraphNode[]>;
   /**
+   * Cross-session plan recall — list `Plan` nodes tenant-wide (the team
+   * scope), optionally narrowed to a single `userId`, most-recent first
+   * (by `props.createdAt`). When `openOnly` is set, only plans that still
+   * have at least one `pending`/`in_progress` step are returned — i.e.
+   * unfinished work worth resuming. Powers the per-turn KG-recall probe;
+   * `listPlansForScope` is the single-session variant. `limit` is clamped
+   * to [1, 50] and defaults to 5.
+   */
+  listRecentPlans(opts: {
+    userId?: string;
+    limit?: number;
+    openOnly?: boolean;
+  }): Promise<GraphNode[]>;
+  /**
    * Structured run-subgraph for a single Turn: Run node + AgentInvocations
    * with their ToolCalls + orchestrator-level ToolCalls + produced entities.
    * Returns `null` when no Run has been ingested yet for the given turn.
@@ -655,6 +669,14 @@ export interface MemorableKnowledgeSearchOptions {
   limit?: number;
   /** Hits below this cosine similarity dropped. Default 0.3. */
   minSimilarity?: number;
+  /**
+   * Opt-in team-scope recall. When true, the ACL gate also admits rows
+   * whose `visibility` is `team` or `public` within the same tenant — not
+   * just rows the viewer directly owns via `acl_owners`. `visibility`
+   * `private` stays strictly owner-only regardless. Default false (the
+   * historical owner-only behaviour).
+   */
+  teamVisibility?: boolean;
 }
 
 /** Slice 7 — single MK hit from semantic search. */
@@ -670,6 +692,12 @@ export interface ExcerptSearchOptions {
   viewerOmadiaUserId: string;
   limit?: number;
   minSimilarity?: number;
+  /**
+   * Opt-in team-scope recall — mirrors
+   * {@link MemorableKnowledgeSearchOptions.teamVisibility}. The gate runs
+   * against the parent MK's `visibility`. Default false.
+   */
+  teamVisibility?: boolean;
 }
 
 /** Slice 7 — single excerpt hit, carries the parent-MK external_id
@@ -678,6 +706,54 @@ export interface PalaiaExcerptHit {
   excerpt: PalaiaExcerptNode;
   parentMkId: string;
   cosineSim: number;
+}
+
+// ---------------------------------------------------------------------------
+// Cross-session recall probe — structured payload of what the per-turn probe
+// surfaced from PRIOR sessions. Defined here (the lowest common type package)
+// so both the recall producer (@omadia/orchestrator-extras) and the
+// channel-facing answer contract (@omadia/channel-sdk · SemanticAnswer /
+// ChatTurnResult) can reference it without a circular dependency.
+// ---------------------------------------------------------------------------
+
+/** One resumable plan from a PRIOR session. `openStepGoals` are the goals of
+ *  its still-pending/in-progress steps. */
+export interface RecalledPlan {
+  /** External id `plan:<planId>`. */
+  planId: string;
+  scope: string;
+  strategy?: string;
+  createdAt?: string;
+  openStepGoals: string[];
+  doneCount: number;
+  totalCount: number;
+}
+
+/** One stored process matching the current message. */
+export interface RecalledProcess {
+  /** External id `process:<scope>:<slug>`. */
+  id: string;
+  title: string;
+  scope: string;
+  stepCount: number;
+  score: number;
+}
+
+/** One curated insight (MemorableKnowledge) recalled cross-session. */
+export interface RecalledInsight {
+  mkId: string;
+  kind: string;
+  summary: string;
+  score: number;
+}
+
+/** What the cross-session probe surfaced this turn. Empty arrays when a leg
+ *  found nothing or was disabled. Powers both the prompt-injected recall
+ *  blocks and the visible recall card / Teams Adaptive Card. */
+export interface RecalledContext {
+  plans: RecalledPlan[];
+  processes: RecalledProcess[];
+  insights: RecalledInsight[];
 }
 
 /** Slice 5 — partial content-patch on a MemorableKnowledge. All fields
