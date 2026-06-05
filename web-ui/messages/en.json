@@ -819,6 +819,7 @@
         "fields": {
           "agentId": "Agent ID",
           "name": "Name",
+          "author": "Author",
           "version": "Version",
           "template": "Template",
           "category": "Category",
