@@ -2295,6 +2295,11 @@ export class Orchestrator {
       ...(parent?.captureRawToolResult
         ? { captureRawToolResult: parent.captureRawToolResult }
         : {}),
+      // Canvas sentinel tap — canvas turns ARE streaming turns; without this
+      // carry-over the ui-orchestrator's sink dies exactly here.
+      ...(parent?.canvasSentinelSink
+        ? { canvasSentinelSink: parent.canvasSentinelSink }
+        : {}),
     });
 
     this.applyTurnAuthContext(input);
