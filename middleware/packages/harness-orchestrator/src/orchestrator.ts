@@ -3155,6 +3155,18 @@ export class Orchestrator {
       if (subAgentBypassFlag.value && subAgentSink.length === 0) {
         return result;
       }
+      // Canvas sentinel tap: interning is about the LLM wire — the surface
+      // synthesis is server-side and must compose from the RAW directive
+      // (incl. dataset rows resolved server-side that the LLM never sees).
+      // Tap before interning; the LLM still gets only the digest below.
+      const sentinelSink = turnContext.current()?.canvasSentinelSink;
+      if (sentinelSink !== undefined && result.includes('"_pending')) {
+        try {
+          sentinelSink(name, result);
+        } catch (err) {
+          console.warn(`[orchestrator.dispatchTool:${name}] canvasSentinelSink threw:`, err);
+        }
+      }
       // Intern the raw result server-side and hand the LLM only the
       // identity-free digest — the raw rows never reach the LLM wire.
       try {

@@ -105,6 +105,26 @@ const looksLikeDatasetRef = (rows: ReadonlyArray<Record<string, unknown>>): bool
  *  bigger sets belong in a file (create_xlsx) or a filtered view. */
 const MAX_DATASET_PUBLISH_ROWS = 500;
 
+/** Install the canvas sentinel tap on the current turn and return the FIFO
+ *  lookup for `synthesizeSurfaceEvents`. On privacy-guard servers every tool
+ *  result reaching the stream is the interned digest — the guard's dispatch
+ *  sites hand the RAW sentinel-bearing result to this sink BEFORE interning,
+ *  so synthesis composes from ground truth (incl. server-side resolved
+ *  dataset rows the LLM never sees). Guard-less servers never call the sink
+ *  and the lookup stays empty — behaviour is unchanged there. */
+function tapCanvasSentinels(): (toolName: string) => string | undefined {
+  const queues = new Map<string, string[]>();
+  const t = turnContext.current();
+  if (t !== undefined) {
+    t.canvasSentinelSink = (toolName, raw) => {
+      const q = queues.get(toolName);
+      if (q) q.push(raw);
+      else queues.set(toolName, [raw]);
+    };
+  }
+  return (toolName) => queues.get(toolName)?.shift();
+}
+
 /** NativeToolHandler for {@link CANVAS_PUBLISH_TOOL}. Exported for tests.
  *  Accepts EITHER `rows` (tabular → table/chart) OR `fields` (a flat scalar
  *  object → a KPI/score container) OR `datasetId` (a privacy-shield dataset
@@ -799,6 +819,7 @@ export async function activate(
         baseTree: input.canvasState.currentTree,
         dataRequirements: requirements,
         onPublishedSource: captureSource(canvasSessionId),
+        takeRawSentinel: tapCanvasSentinels(),
         log: (message) => ctx.log(message),
       });
       return;
@@ -891,6 +912,7 @@ export async function activate(
       baseTree: skeleton.tree,
       dataRequirements: skeleton.dataRequirements,
       onPublishedSource: captureSource(canvasSessionId),
+      takeRawSentinel: tapCanvasSentinels(),
       log: (message) => ctx.log(message),
     });
   }
@@ -1021,6 +1043,7 @@ export async function activate(
       baseRevision: refresh.basedOnRevision as RevisionId,
       baseTree: refresh.currentTree,
       dataRequirements: requirements,
+      takeRawSentinel: tapCanvasSentinels(),
       refreshContainers: new Set(requirements.map((r) => r.containerId)),
       // a fallback refresh that publishes WITH a source upgrades the next
       // refresh of this canvas to the deterministic path
