@@ -1,7 +1,11 @@
 import { execSync } from 'node:child_process';
 import path from 'node:path';
 import { fileURLToPath } from 'node:url';
-import Anthropic from '@anthropic-ai/sdk';
+import {
+  createAnthropicClient,
+  readProviderApiKey,
+  type AnthropicClient,
+} from '@omadia/llm-provider';
 import express from 'express';
 import cookieParser from 'cookie-parser';
 import { config, parseRegistries } from './config.js';
@@ -66,6 +70,7 @@ import { createPackagesRouter } from './routes/packages.js';
 import { createRegistryInstallRouter } from './routes/registryInstall.js';
 import { createRuntimeRouter } from './routes/runtime.js';
 import { createAdminSettingsRouter } from './routes/adminSettings.js';
+import { createAdminProvidersRouter } from './routes/adminProviders.js';
 import { createVaultStatusRouter } from './routes/vaultStatus.js';
 import { createBuilderRouter } from './routes/builder.js';
 import {
@@ -319,7 +324,7 @@ async function main(): Promise<void> {
   // inner calls / Teams) is only reachable AFTER the orchestrator has
   // activated — which in turn requires the key. Falling back to '' here
   // keeps the SDK constructor happy on cold boots.
-  const client = new Anthropic({
+  const client = createAnthropicClient({
     apiKey: config.ANTHROPIC_API_KEY ?? '',
     maxRetries: 5,
   });
@@ -337,8 +342,8 @@ async function main(): Promise<void> {
   // never this const. Host-side consumers (BuilderAgent, PreviewChatService)
   // therefore take this accessor and re-resolve the current client per turn
   // instead of capturing the boot instance.
-  const currentAnthropicClient = (): Anthropic =>
-    serviceRegistry.get<Anthropic>('anthropicClient') ?? client;
+  const currentAnthropicClient = (): AnthropicClient =>
+    serviceRegistry.get<AnthropicClient>('anthropicClient') ?? client;
 
   // OB-29-3 — wrap the Anthropic client as an `llm` ServiceRegistry
   // provider so plugins that declare `permissions.llm.models_allowed`
@@ -566,6 +571,18 @@ async function main(): Promise<void> {
     subAgentModel: config.SUB_AGENT_MODEL,
     subAgentMaxTokens: config.SUB_AGENT_MAX_TOKENS,
     subAgentMaxIterations: config.SUB_AGENT_MAX_ITERATIONS,
+    // Dynamic sub-agents inherit the orchestrator's configured provider so the
+    // stack runs on any provider (incl. OpenAI-only, no Anthropic key). Both are
+    // late-bound: a post-boot provider/key change is picked up on next build.
+    hostProviderId: () => {
+      const raw = installedRegistry.get('@omadia/orchestrator')?.config?.[
+        'llm_provider'
+      ];
+      return typeof raw === 'string' && raw.trim().length > 0
+        ? raw.trim()
+        : 'anthropic';
+    },
+    hostGetSecret: (key: string) => secretVault.get('@omadia/orchestrator', key),
     serviceRegistry,
     nativeToolRegistry,
     pluginRouteRegistry,
@@ -932,9 +949,12 @@ async function main(): Promise<void> {
     sourceAgentId: string = ANTHROPIC_SHARED_CLIENT_SOURCE,
   ): Promise<void> => {
     try {
-      const key = await secretVault.get(sourceAgentId, 'anthropic_api_key');
+      const key = await readProviderApiKey(
+        (k) => secretVault.get(sourceAgentId, k),
+        'anthropic',
+      );
       if (!key || key === sharedAnthropicKeyApplied) return;
-      const refreshed = new Anthropic({ apiKey: key, maxRetries: 5 });
+      const refreshed = createAnthropicClient({ apiKey: key, maxRetries: 5 });
       serviceRegistry.replace('anthropicClient', refreshed);
       serviceRegistry.replace(
         'llm',
@@ -2316,6 +2336,20 @@ async function main(): Promise<void> {
     }),
   );
   console.log('[middleware] settings overview endpoint ready at /api/v1/admin/settings (auth: required)');
+
+  // Dedicated models/providers admin (S6) — providers + registry models +
+  // per-plugin provider/model selection. Separate from the settings catalog so
+  // many providers/models can be managed on their own page.
+  app.use(
+    '/api/v1/admin/providers',
+    requireAuth,
+    createAdminProvidersRouter({
+      installedRegistry,
+      vault: secretVault,
+      reactivate: reactivateAgent,
+    }),
+  );
+  console.log('[middleware] providers admin endpoint ready at /api/v1/admin/providers (auth: required)');
 
   // ── Agent-Builder drafts (B.0) ────────────────────────────────────────────
   // SQLite-backed draft store; persists alongside the vault so redeploys

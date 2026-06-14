@@ -42,11 +42,21 @@ import {
 } from '@omadia/plugin-api';
 import type { DomainTool } from '@omadia/orchestrator';
 import { turnContext } from '@omadia/orchestrator';
+import {
+  coerceModelToProvider,
+  isClassRef,
+  modelForClass,
+  resolveLlmProvider,
+  resolveModelRef,
+  type ModelClass,
+  type ProviderId,
+} from '@omadia/llm-provider';
 
 import type { InstalledRegistry } from '../plugins/installedRegistry.js';
 import type { JobScheduler } from '../plugins/jobScheduler.js';
 import type { PluginCatalog } from '../plugins/manifestLoader.js';
 import type { SecretVault } from '../secrets/vault.js';
+import { createLlmProviderFromNeutral } from './anthropicLlmProvider.js';
 import type { NativeToolRegistry } from '@omadia/orchestrator';
 import type { PluginRouteRegistry } from './pluginRouteRegistry.js';
 import type { NotificationRouter } from './notificationRouter.js';
@@ -404,6 +414,8 @@ export function createPluginContext(
     callerAgentId: agentId,
     permissions: extractLlmPermissions(agentId, catalog),
     serviceRegistry,
+    activeProvider: resolveActiveProvider(registry, agentId),
+    vault,
   });
 
   return {
@@ -597,6 +609,32 @@ interface LlmPermissions {
   readonly maxTokensPerCall: number;
 }
 
+/**
+ * The LLM provider that serves THIS plugin's `ctx.llm`. Resolution order:
+ *  1. the plugin's OWN `llm_provider` config (per-plugin pinning, written by the
+ *     provider-admin `/assignment` endpoint),
+ *  2. the global default — the orchestrator's `llm_provider` config, exactly as
+ *     the kernel's dynamic sub-agent wiring reads it (`hostProviderId()` in
+ *     src/index.ts),
+ *  3. `'anthropic'` when neither is set, so the default path is unchanged.
+ * This same provider drives BOTH the `class:*` whitelist resolution AND the
+ * provider the call is actually served on (see `createLlmAccessor`), so gate and
+ * execution can never disagree.
+ */
+function resolveActiveProvider(
+  registry: InstalledRegistry,
+  agentId: string,
+): ProviderId {
+  const pinned = registry.get(agentId)?.config?.['llm_provider'];
+  if (typeof pinned === 'string' && pinned.trim().length > 0) {
+    return pinned.trim();
+  }
+  const global = registry.get('@omadia/orchestrator')?.config?.['llm_provider'];
+  return typeof global === 'string' && global.trim().length > 0
+    ? global.trim()
+    : 'anthropic';
+}
+
 function extractLlmPermissions(
   agentId: string,
   catalog: PluginCatalog,
@@ -614,13 +652,58 @@ function extractLlmPermissions(
 }
 
 /**
- * Glob-style match for LLM model names.
- *   - `'claude-haiku-4-5'` matches exact only
- *   - `'claude-haiku-4-5*'` matches anything starting with that prefix
- *     (e.g. `'claude-haiku-4-5-20251001'`)
- *   - `'*'` matches anything (use sparingly — sidesteps the whitelist)
+ * Match a single whitelist entry against the requested model id, where
+ * `activeProvider` is the LLM provider the runtime is currently serving
+ * `ctx.llm` from (see `resolveActiveProvider`).
+ *
+ * Two entry shapes are supported:
+ *
+ * 1. Concrete / wildcard (back-compat, provider-agnostic strings) — unchanged
+ *    glob semantics, matched against the raw requested id:
+ *      - `'claude-haiku-4-5'`  → exact match only
+ *      - `'claude-haiku-4-5*'` → prefix match (`'claude-haiku-4-5-20251001'`)
+ *      - `'*'`                 → matches anything (sidesteps the whitelist)
+ *    Existing installed agents that lock to `['claude-haiku-4-5*']` keep
+ *    gating EXACTLY as before, on every provider.
+ *
+ * 2. Class ref (`class:fast|balanced|frontier`) — provider-agnostic. The class
+ *    is resolved against the ACTIVE provider via `modelForClass(cls,
+ *    activeProvider)`; the request is permitted ONLY when it denotes THAT model
+ *    on the active provider. We accept the resolved bare `modelId`, the
+ *    provider-qualified id (`<provider>:<modelId>`), and any registry ref that
+ *    resolves (with the active provider as default) to a model owned by the
+ *    active provider with the same `modelId` — e.g. the legacy alias `haiku`
+ *    under anthropic. A bare id that the registry attributes to a DIFFERENT
+ *    provider (e.g. `gpt-5.4-mini` while anthropic is active) does NOT match,
+ *    so a `class:fast` lock permits the active provider's fast model and
+ *    nothing else. On the Anthropic default this resolves to
+ *    `claude-haiku-4-5-20251001` (class `fast`), `claude-sonnet-4-6`
+ *    (`balanced`), `claude-opus-4-8` (`frontier`) — byte-identical gating to a
+ *    concrete Anthropic lock today.
  */
-function modelMatch(pattern: string, candidate: string): boolean {
+function modelMatch(
+  pattern: string,
+  candidate: string,
+  activeProvider: ProviderId,
+): boolean {
+  if (isClassRef(pattern)) {
+    const cls = pattern.slice('class:'.length) as ModelClass;
+    const target = modelForClass(cls, activeProvider);
+    // Unknown class on this provider → no match (fail closed, never throws).
+    if (target === undefined) return false;
+    if (candidate === target.modelId || candidate === target.id) return true;
+    // Accept registry refs (e.g. the legacy alias `haiku`) that resolve to the
+    // SAME active-provider model. Resolution is pinned to the active provider
+    // and must land on that provider — a cross-provider id never leaks through.
+    const resolved = resolveModelRef(candidate, {
+      defaultProvider: activeProvider,
+    });
+    return (
+      resolved !== undefined &&
+      resolved.provider === activeProvider &&
+      resolved.modelId === target.modelId
+    );
+  }
   if (pattern === '*') return true;
   if (pattern.endsWith('*')) {
     const prefix = pattern.slice(0, -1);
@@ -633,17 +716,54 @@ interface LlmAccessorOptions {
   callerAgentId: string;
   permissions: LlmPermissions | undefined;
   serviceRegistry: ServiceRegistry;
+  /** Provider that serves THIS plugin's `ctx.llm` (per-plugin pin → global →
+   *  anthropic). Drives both class-ref whitelist resolution AND which provider
+   *  the call is built on, so gate and execution stay in lockstep. */
+  activeProvider: ProviderId;
+  /** Vault for reading the active provider's API key when it is not the
+   *  Anthropic default (which keeps using the shared, env/vault-armed
+   *  `'llm'` service). */
+  vault: SecretVault;
 }
 
 function createLlmAccessor(
   opts: LlmAccessorOptions,
 ): LlmAccessor | undefined {
-  const { callerAgentId, permissions, serviceRegistry } = opts;
+  const { callerAgentId, permissions, serviceRegistry, activeProvider, vault } =
+    opts;
   if (!permissions) return undefined;
 
   let callsUsed = 0;
   const log = (...args: unknown[]): void =>
     console.log(`[${callerAgentId}/llm]`, ...args);
+
+  // Non-Anthropic providers are built once from the plugin's vault key and
+  // cached for this context's lifetime (a re-assignment reactivates the plugin
+  // → fresh context → fresh accessor, so the cache never goes stale). The
+  // Anthropic default keeps using the shared `'llm'` service so the existing
+  // ENV-or-vault key path stays byte-identical. Cache the in-flight build
+  // promise so concurrent first callers await the same provider construction.
+  let buildPromise: Promise<LlmProvider | undefined> | undefined;
+  const resolveServingProvider = (): Promise<LlmProvider | undefined> => {
+    if (activeProvider === 'anthropic') {
+      return Promise.resolve(serviceRegistry.get<LlmProvider>('llm'));
+    }
+    if (buildPromise === undefined) {
+      buildPromise = (async () => {
+        const neutral = await resolveLlmProvider({
+          providerId: activeProvider,
+          getSecret: (key) => vault.get(callerAgentId, key),
+          log,
+        });
+        // Bridge the neutral adapter to the narrow plugin-facing LlmProvider —
+        // the same translation the Anthropic 'llm' service uses.
+        return neutral !== undefined
+          ? createLlmProviderFromNeutral(neutral, log)
+          : undefined;
+      })();
+    }
+    return buildPromise;
+  };
 
   return {
     modelsAllowed: permissions.modelsAllowed,
@@ -655,12 +775,14 @@ function createLlmAccessor(
         );
       }
       const allowed = permissions.modelsAllowed.some((p) =>
-        modelMatch(p, req.model),
+        modelMatch(p, req.model, activeProvider),
       );
       if (!allowed) {
         throw new LlmModelNotAllowedError(callerAgentId, req.model);
       }
-      const provider = serviceRegistry.get<LlmProvider>('llm');
+      // Fail loud if the pinned provider has no configured key — never silently
+      // serve a different provider than the one the gate authorised against.
+      const provider = await resolveServingProvider();
       if (!provider) throw new LlmServiceUnavailableError(callerAgentId);
 
       // Silent-clamp of maxTokens to manifest cap. Plugin-side larger
@@ -677,9 +799,16 @@ function createLlmAccessor(
         );
       }
 
+      // Coerce the requested model to the serving provider: a `class:*` ref or a
+      // cross-vendor id maps to that provider's same-class model; a concrete id
+      // the provider already owns is returned unchanged (Anthropic default is
+      // idempotent — byte-identical to before). Unknown/custom ids pass through.
+      const model = coerceModelToProvider(req.model, activeProvider);
+
       callsUsed += 1;
       return provider.complete({
         ...req,
+        model,
         maxTokens: effectiveMaxTokens,
       });
     },

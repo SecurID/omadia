@@ -1,4 +1,5 @@
-import Anthropic from '@anthropic-ai/sdk';
+import type { LlmProvider } from '@omadia/llm-provider';
+import { resolveLlmProvider } from '@omadia/llm-provider';
 import type { PluginContext } from '@omadia/plugin-api';
 import type { EmbeddingClient } from '@omadia/embeddings';
 import type {
@@ -29,7 +30,10 @@ import {
 import { CaptureFilteringKnowledgeGraph } from './captureFilteringKnowledgeGraph.js';
 import { ContextRetriever } from './contextRetriever.js';
 import type { Pool } from 'pg';
-import { initUsageRecorder, withUsageTracking } from '@omadia/usage-telemetry';
+import {
+  initUsageRecorder,
+  withProviderUsageTracking,
+} from '@omadia/usage-telemetry';
 
 import { createBulkExcerptMergeDetectService } from './bulkExcerptMergeDetect.js';
 import { createBulkInconsistencyService } from './bulkInconsistency.js';
@@ -128,9 +132,14 @@ export async function activate(
     };
   }
 
-  // S+12.6: anthropic_api_key is vault-stored (matches database_url-pattern).
-  // Bootstrap migrates pre-S+12.6 entries automatically (config → vault).
-  const apiKey = ((await ctx.secrets.get('anthropic_api_key')) ?? '').trim();
+  // Build the configured LLM provider (default Anthropic) from the vault.
+  // undefined → no key for the chosen provider; the Haiku scorers stay off.
+  const providerId =
+    (ctx.config.get<string>('llm_provider') ?? '').trim() || 'anthropic';
+  const baseProvider = await resolveLlmProvider({
+    providerId,
+    getSecret: (k) => ctx.secrets.get(k),
+  });
   const factModel =
     (ctx.config.get<string>('fact_extractor_model') ?? '').trim() ||
     DEFAULT_HAIKU_MODEL;
@@ -261,11 +270,9 @@ export async function activate(
   const usagePool = ctx.services.get<Pool>('graphPool');
   if (usagePool) initUsageRecorder(usagePool);
 
-  let anthropic: Anthropic | undefined;
-  if (apiKey) {
-    anthropic = withUsageTracking(new Anthropic({ apiKey }), {
-      source: 'extras',
-    });
+  let llm: LlmProvider | undefined;
+  if (baseProvider) {
+    llm = withProviderUsageTracking(baseProvider, { source: 'extras' });
   }
 
   // ---------------------------------------------------------------------
@@ -296,9 +303,9 @@ export async function activate(
   // Slice 8 — extract the scorer so the bulkPromotion service can
   // reuse it. CaptureFilter wraps it transparently for the live path;
   // the bulk job calls `.score(text)` directly.
-  const significanceScorer = anthropic
+  const significanceScorer = llm
     ? createHaikuSignificanceScorer({
-        anthropic,
+        llm,
         model: factModel,
         log: ctx.log,
       })
@@ -330,7 +337,7 @@ export async function activate(
   const inconsistencyDetector = createInconsistencyDetector({
     graph: captureWrappedKg,
     ...(embeddingClient ? { embeddingClient } : {}),
-    ...(anthropic ? { anthropic, model: factModel } : {}),
+    ...(llm ? { llm, model: factModel } : {}),
     log: (msg) => { console.error(msg); },
   });
   const disposeInconsistencyDetector = ctx.services.provide(
@@ -343,7 +350,7 @@ export async function activate(
     log: (msg) => { console.error(msg); },
   });
   ctx.log(
-    `[harness-orchestrator-extras] inconsistency-detector ready (embed=${embeddingClient ? 'on' : 'off'}, judge=${anthropic ? 'on' : 'off'})`,
+    `[harness-orchestrator-extras] inconsistency-detector ready (embed=${embeddingClient ? 'on' : 'off'}, judge=${llm ? 'on' : 'off'})`,
   );
 
   // Slice 10 — MergeCandidate detector + triggering wrapper. Stack
@@ -373,7 +380,7 @@ export async function activate(
   );
 
   ctx.log(
-    `[harness-orchestrator-extras] capture-filter activated (level=${captureLevel}, threshold=${captureSignificanceThreshold.toFixed(2)}, visibility=${captureDefaultVisibility}, scorer=${captureLevel === 'minimal' || captureLevel === 'off' ? 'disabled-by-level' : anthropic ? 'haiku' : 'unavailable-no-key'})`,
+    `[harness-orchestrator-extras] capture-filter activated (level=${captureLevel}, threshold=${captureSignificanceThreshold.toFixed(2)}, visibility=${captureDefaultVisibility}, scorer=${captureLevel === 'minimal' || captureLevel === 'off' ? 'disabled-by-level' : llm ? 'haiku' : 'unavailable-no-key'})`,
   );
 
   // OB-76 — Process-Memory handle, resolved once and reused below (the
@@ -537,7 +544,7 @@ export async function activate(
   const bulkInconsistency = createBulkInconsistencyService({
     kg: wrappedKg,
     detector: inconsistencyDetector,
-    judgementAvailable: anthropic !== undefined,
+    judgementAvailable: llm !== undefined,
     log: (msg) => { console.error(msg); },
   });
   const disposeBulkInconsistency = ctx.services.provide(
@@ -545,7 +552,7 @@ export async function activate(
     bulkInconsistency,
   );
   ctx.log(
-    `[harness-orchestrator-extras] bulkInconsistency ready (judge=${anthropic ? 'on' : 'off'})`,
+    `[harness-orchestrator-extras] bulkInconsistency ready (judge=${llm ? 'on' : 'off'})`,
   );
 
   // Slice 10 — bulk merge-detect service. Cosine-only → always
@@ -585,7 +592,7 @@ export async function activate(
   // without Haiku the operator can still cluster + browse.
   const topicClustering = createTopicClusteringService({
     kg: wrappedKg,
-    ...(anthropic ? { anthropic, model: factModel } : {}),
+    ...(llm ? { llm, model: factModel } : {}),
     log: (msg) => { console.error(msg); },
   });
   const disposeTopicClustering = ctx.services.provide(
@@ -593,7 +600,7 @@ export async function activate(
     topicClustering,
   );
   ctx.log(
-    `[harness-orchestrator-extras] topicClustering ready (naming=${anthropic ? 'haiku' : 'fallback'})`,
+    `[harness-orchestrator-extras] topicClustering ready (naming=${llm ? 'haiku' : 'fallback'})`,
   );
 
   let disposeFactExtractor: (() => void) | undefined;
@@ -601,9 +608,9 @@ export async function activate(
   let disposeSessionBriefing: (() => void) | undefined;
   let disposePalaiaExcerpt: (() => void) | undefined;
 
-  if (anthropic) {
+  if (llm) {
     const factExtractor = new FactExtractor({
-      anthropic,
+      llm,
       graph: wrappedKg,
       model: factModel,
     });
@@ -618,7 +625,7 @@ export async function activate(
     // picks it up via `palaiaExcerpt` service-name and threads it
     // through new Orchestrator({…, excerptExtractor}).
     const palaiaExcerptExtractor = createHaikuPalaiaExcerptExtractor({
-      anthropic,
+      llm,
       model: factModel,
       log: (msg) => { console.error(msg); },
     });
@@ -633,7 +640,7 @@ export async function activate(
     // resolved if KG-Neon published it — without pool the briefing
     // skips the open-tasks block (graceful degrade).
     const summaryGenerator = createHaikuSessionSummaryGenerator({
-      anthropic,
+      llm,
       model: factModel,
       log: (msg) => { console.error(msg); },
     });
@@ -657,7 +664,7 @@ export async function activate(
     );
 
     if (embeddingClient) {
-      const topicDetector = new TopicDetector(embeddingClient, anthropic, {
+      const topicDetector = new TopicDetector(embeddingClient, llm, {
         upperThreshold,
         lowerThreshold,
         classifierModel,
@@ -699,7 +706,7 @@ export async function activate(
   );
 
   ctx.log(
-    `[harness-orchestrator-extras] ready (contextRetriever=on, factExtractor=${anthropic ? 'on' : 'off'}, topicDetector=${anthropic && embeddingClient ? 'on' : 'off'}, sessionBriefing=${disposeSessionBriefing ? 'on' : 'off'}, palaiaExcerpt=${disposePalaiaExcerpt ? 'on' : 'off'}, nudgeProviders=on)`,
+    `[harness-orchestrator-extras] ready (contextRetriever=on, factExtractor=${llm ? 'on' : 'off'}, topicDetector=${llm && embeddingClient ? 'on' : 'off'}, sessionBriefing=${disposeSessionBriefing ? 'on' : 'off'}, palaiaExcerpt=${disposePalaiaExcerpt ? 'on' : 'off'}, nudgeProviders=on)`,
   );
 
   return {

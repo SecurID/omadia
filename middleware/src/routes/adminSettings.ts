@@ -194,18 +194,39 @@ export function createAdminSettingsRouter(deps: AdminSettingsDeps): Router {
           errors.push({ key, message: 'Anthropic-Keys beginnen mit "sk-ant-"' });
           continue;
         }
+        if (
+          def.key === 'OPENAI_API_KEY' &&
+          (!value.startsWith('sk-') || value.startsWith('sk-ant-'))
+        ) {
+          errors.push({
+            key,
+            message: 'OpenAI-Keys beginnen mit "sk-" (nicht "sk-ant-")',
+          });
+          continue;
+        }
       }
 
       if (def.secret) {
+        const legacyKey = def.secret.legacyVaultKey;
         for (const scope of def.secret.scopes) {
           if (cleared) {
             const list = secretDelete.get(scope) ?? [];
             list.push(def.secret.vaultKey);
+            // Also delete the legacy fallback key, else readProviderApiKey keeps
+            // resolving the stale key and the operator's revoke is ineffective.
+            if (legacyKey !== undefined) list.push(legacyKey);
             secretDelete.set(scope, list);
           } else {
             const map = secretSet.get(scope) ?? {};
             map[def.secret.vaultKey] = value;
             secretSet.set(scope, map);
+            // Drop the now-redundant legacy key so it can't diverge from the
+            // canonical value the operator just set (writes run before deletes).
+            if (legacyKey !== undefined) {
+              const dl = secretDelete.get(scope) ?? [];
+              dl.push(legacyKey);
+              secretDelete.set(scope, dl);
+            }
           }
           affected.add(scope);
         }

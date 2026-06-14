@@ -1,6 +1,6 @@
-import Anthropic from '@anthropic-ai/sdk';
 import type { ChatAgent } from '@omadia/channel-sdk';
 import type { EmbeddingClient } from '@omadia/embeddings';
+import { resolveLlmProvider } from '@omadia/llm-provider';
 // Phase 5B: structural shim — `@omadia/integration-microsoft365` lives
 // in the byte5-plugins backup repo. The orchestrator types against a
 // narrow accessor shape that matches what the plugin publishes under
@@ -201,14 +201,24 @@ export async function activate(
 ): Promise<OrchestratorPluginHandle> {
   ctx.log('activating orchestrator plugin');
 
-  // S+12.6: anthropic_api_key is vault-stored (matches database_url-pattern).
-  // Bootstrap writes it during installation; operator can override via setup-form
-  // post-install. Pre-S+12.6 entries are migrated automatically by
-  // bootstrapOrchestratorFromEnv on first boot (config → vault).
-  const apiKey = ((await ctx.secrets.get('anthropic_api_key')) ?? '').trim();
-  if (!apiKey) {
+  // Build the configured LLM provider (default Anthropic) from the vault —
+  // shared across every Agent built from this plugin. The factory reads the
+  // provider-namespaced key (with the legacy fallback for Anthropic); undefined
+  // means no key is configured for the chosen provider.
+  //
+  // maxRetries: 5 — the SDK auto-retries 408/409/429/500/529 with exponential
+  // backoff (default 2); bumped to 5 so a transient overloaded_error (HTTP 529)
+  // burst is far more likely to ride out inside the SDK than fail a turn.
+  const providerId =
+    (ctx.config.get<string>('llm_provider') ?? '').trim() || 'anthropic';
+  const provider = await resolveLlmProvider({
+    providerId,
+    getSecret: (k) => ctx.secrets.get(k),
+    maxRetries: 5,
+  });
+  if (!provider) {
     ctx.log(
-      '[harness-orchestrator] anthropic_api_key not set — chatAgent@1 capability NOT published',
+      `[harness-orchestrator] no API key for provider '${providerId}' — chatAgent@1 capability NOT published`,
     );
     return {
       async close(): Promise<void> {
@@ -414,13 +424,7 @@ export async function activate(
   // this just ensures the recorder has a pool to flush to. Idempotent.
   if (graphPool) initUsageRecorder(graphPool);
 
-  // Anthropic client — shared across every Agent built from this plugin.
-  //
-  // maxRetries: the Anthropic SDK auto-retries 408/409/429/500/529 with
-  // exponential backoff. The SDK default is 2; bumped to 5 so a transient
-  // `overloaded_error` (HTTP 529) burst is far more likely to ride out
-  // inside the SDK instead of surfacing as a failed turn. (Merged from main.)
-  const client = new Anthropic({ apiKey, maxRetries: 5 });
+  // (LLM provider built above from the configured provider id.)
 
   // OB-77 (Palaia Phase 8) — Nudge-Pipeline. Publish a fresh in-memory
   // registry, then drain `nudgeProviders@1` (side-channel for plugins
@@ -435,12 +439,12 @@ export async function activate(
   const queuedNudgeProviders =
     ctx.services.get<readonly NudgeProvider[]>(NUDGE_PROVIDERS_SERVICE_NAME) ??
     [];
-  for (const provider of queuedNudgeProviders) {
+  for (const nudgeProvider of queuedNudgeProviders) {
     try {
-      nudgeRegistry.register(provider);
+      nudgeRegistry.register(nudgeProvider);
     } catch (err) {
       ctx.log(
-        `[harness-orchestrator] failed to register queued nudge provider "${provider.id}": ${err instanceof Error ? err.message : String(err)}`,
+        `[harness-orchestrator] failed to register queued nudge provider "${nudgeProvider.id}": ${err instanceof Error ? err.message : String(err)}`,
       );
     }
   }
@@ -464,6 +468,11 @@ export async function activate(
   // `this.nativeTools.get(name).handler` and the getTools() call picks
   // the spec live into the LLM-tool list. No orchestrator code touch.
   const disposeProcessMemoryTools: Array<() => void> = [];
+  // Service-provider disposers, released on deactivate so a reactivate (e.g. a
+  // provider switch via /admin/providers) can re-publish chatAgent@1 et al.
+  // without a "duplicate provider" error. Without this, reactivating an already-
+  // active orchestrator throws and leaves chat down.
+  const disposeServices: Array<() => void> = [];
   if (processMemory) {
     disposeProcessMemoryTools.push(
       nativeToolRegistry.register(WRITE_PROCESS_TOOL_NAME, {
@@ -504,7 +513,7 @@ export async function activate(
   // (US4) calls the same factory once per configured Agent against the
   // same `deps`.
   const orchestratorDeps: OrchestratorDeps = {
-    client,
+    provider,
     knowledgeGraph,
     memoryStore,
     entityRefBus,
@@ -534,7 +543,14 @@ export async function activate(
   // is true, a Haiku classifier picks the model per turn: simple → Sonnet,
   // complex → Opus. Models default to the existing orchestrator/sub-agent/
   // classifier config so it works out of the box once the flag is set.
+  //
+  // Provider-gated: per-turn routing assumes a single provider serving the
+  // Claude model family (its defaults/fallbacks are claude-* ids). It is only
+  // valid for Anthropic — under any other provider the one configured provider
+  // would receive Claude model ids. Cross-provider per-turn routing is future
+  // work; until then routing is suppressed for non-Anthropic providers.
   const modelRoutingEnabled =
+    providerId === 'anthropic' &&
     (ctx.config.get<string>('orchestrator_model_routing') ?? '')
       .trim()
       .toLowerCase() === 'true';
@@ -577,7 +593,7 @@ export async function activate(
     },
     orchestratorDeps,
   );
-  ctx.services.provide(CHAT_AGENT_SERVICE, built.bundle);
+  disposeServices.push(ctx.services.provide(CHAT_AGENT_SERVICE, built.bundle));
 
   // US4 — multi-orchestrator registry. Optional: only when a Postgres pool
   // is available (test/in-memory boots skip it). The registry runs its own
@@ -601,7 +617,7 @@ export async function activate(
       // can perform writes without re-instantiating its own store
       // (singleton; cheaper than reconnecting, and write events flow
       // through the same trigger → reload-bus pipeline).
-      ctx.services.provide(CONFIG_STORE_SERVICE, store);
+      disposeServices.push(ctx.services.provide(CONFIG_STORE_SERVICE, store));
 
       // US7 / T029 — first-boot fallback Agent seed. Runs before the
       // registry's `start()` so the very first boot already has a fallback
@@ -639,7 +655,9 @@ export async function activate(
           ),
       });
       await registry.start();
-      ctx.services.provide(ORCHESTRATOR_REGISTRY_SERVICE, registry);
+      disposeServices.push(
+        ctx.services.provide(ORCHESTRATOR_REGISTRY_SERVICE, registry),
+      );
       ctx.log(
         `[harness-orchestrator] orchestratorRegistry@1 published (agents=${String(registry.size())})`,
       );
@@ -654,7 +672,9 @@ export async function activate(
             `[harness-orchestrator] ${msg}${fields ? ' ' + JSON.stringify(fields) : ''}`,
           ),
       });
-      ctx.services.provide(CHANNEL_RESOLVER_SERVICE, resolver);
+      disposeServices.push(
+        ctx.services.provide(CHANNEL_RESOLVER_SERVICE, resolver),
+      );
       ctx.log('[harness-orchestrator] channelResolver@1 published');
 
       // US5 / T021 — LISTEN/NOTIFY hot-reload bus. Bound to the same pool
@@ -701,6 +721,16 @@ export async function activate(
         // best-effort
       }
       for (const dispose of disposeProcessMemoryTools) {
+        try {
+          dispose();
+        } catch {
+          // best-effort
+        }
+      }
+      // Release published services (chatAgent@1, orchestratorRegistry@1,
+      // configStore, channelResolver) so a subsequent reactivate can re-publish
+      // them — otherwise the provider switch fails with "duplicate provider".
+      for (const dispose of disposeServices) {
         try {
           dispose();
         } catch {

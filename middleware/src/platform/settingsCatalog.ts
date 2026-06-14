@@ -20,6 +20,11 @@
  * post-install editor uses, so changes take effect live without a restart.
  */
 
+import {
+  legacyProviderApiKeyVaultKey,
+  providerApiKeyVaultKey,
+} from '@omadia/llm-provider';
+
 /** Plugin ids (installed-registry ids / vault scopes) the settings target. */
 const ORCHESTRATOR = '@omadia/orchestrator';
 const ORCHESTRATOR_EXTRAS = '@omadia/orchestrator-extras';
@@ -58,7 +63,17 @@ export interface SettingDef {
    * under its own vault namespace). Values are never read back — the overview
    * only shows set / unset.
    */
-  readonly secret?: { readonly vaultKey: string; readonly scopes: readonly string[] };
+  readonly secret?: {
+    readonly vaultKey: string;
+    readonly scopes: readonly string[];
+    /**
+     * A pre-migration vault key that `readProviderApiKey` still falls back to.
+     * Set so that CLEARING the secret also deletes the legacy key — otherwise a
+     * cleared key keeps resolving via the fallback and the operator's revoke is
+     * silently ineffective.
+     */
+    readonly legacyVaultKey?: string;
+  };
 }
 
 // Category labels (German — the admin section is hardcoded-German, matching
@@ -78,7 +93,25 @@ export const SETTINGS_CATALOG: readonly SettingDef[] = [
     type: 'secret',
     placeholder: 'sk-ant-…',
     secret: {
-      vaultKey: 'anthropic_api_key',
+      // Phase 4: writes the provider-namespaced canonical key. Consumers read
+      // canonical-then-legacy, and bootstrap migrates existing installs, so the
+      // overview "set/unset" + admin writes converge on this key. The legacy key
+      // is deleted on clear (see adminSettings) so a revoke truly revokes.
+      vaultKey: providerApiKeyVaultKey('anthropic'),
+      legacyVaultKey: legacyProviderApiKeyVaultKey('anthropic'),
+      scopes: [ORCHESTRATOR, VERIFIER, ORCHESTRATOR_EXTRAS],
+    },
+  },
+  {
+    key: 'OPENAI_API_KEY',
+    label: 'OpenAI API-Key',
+    help: 'Optional. Für Provider-Auswahl "openai" (pro Plugin via llm_provider). Beginnt mit "sk-". Bestehender Wert wird nie angezeigt. Wird in alle drei Plugin-Vaults geschrieben.',
+    category: C_MODELS,
+    type: 'secret',
+    placeholder: 'sk-…',
+    secret: {
+      // OpenAI is canonical-only (no legacy flat key).
+      vaultKey: providerApiKeyVaultKey('openai'),
       scopes: [ORCHESTRATOR, VERIFIER, ORCHESTRATOR_EXTRAS],
     },
   },
